@@ -1,0 +1,261 @@
+{
+  "type": "excalidraw",
+  "version": 2,
+  "source": "https://excalidraw.com",
+  "elements": [
+    {
+      "type": "text",
+      "id": "title",
+      "x": 120,
+      "y": 0,
+      "width": 900,
+      "height": 30,
+      "angle": 0,
+      "strokeColor": "#1e1e1e",
+      "backgroundColor": "transparent",
+      "fillStyle": "solid",
+      "strokeWidth": 2,
+      "roughness": 1,
+      "opacity": 100,
+      "groupIds": [],
+      "frameId": null,
+      "roundness": null,
+      "seed": 1,
+      "version": 1,
+      "versionNonce": 1,
+      "isDeleted": false,
+      "boundElements": null,
+      "updated": 1,
+      "link": null,
+      "locked": false,
+      "text": "VascMamba-Hybrid 全流程（含 shape 推导）｜241 sessions｜5-fold ACC 87.98%｜~50K 可训练参数",
+      "fontSize": 22,
+      "fontFamily": 5,
+      "textAlign": "left",
+      "verticalAlign": "top",
+      "baseline": 22,
+      "containerId": null,
+      "originalText": "VascMamba-Hybrid 全流程（含 shape 推导）｜241 sessions｜5-fold ACC 87.98%｜~50K 可训练参数",
+      "lineHeight": 1.25
+    },
+
+    {
+      "type": "rectangle", "id": "boxA", "x": 120, "y": 70, "width": 900, "height": 60, "angle": 0,
+      "strokeColor": "#1971c2", "backgroundColor": "#a5d8ff", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": {"type": 3},
+      "seed": 2, "version": 1, "versionNonce": 2, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false
+    },
+    {
+      "type": "text", "id": "txtA", "x": 140, "y": 80, "width": 860, "height": 40, "angle": 0,
+      "strokeColor": "#1e1e1e", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": null,
+      "seed": 3, "version": 1, "versionNonce": 3, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false,
+      "text": "① 数据：241 sessions（60 良性 / 181 恶性）× 4 views PNG\nulm_visionnet/data/patient_index_v2.build_unified_index() → {patient_dir, views[4], label}",
+      "fontSize": 15, "fontFamily": 5, "textAlign": "left", "verticalAlign": "top", "baseline": 36,
+      "containerId": null,
+      "originalText": "① 数据：241 sessions（60 良性 / 181 恶性）× 4 views PNG\nulm_visionnet/data/patient_index_v2.build_unified_index() → {patient_dir, views[4], label}",
+      "lineHeight": 1.25
+    },
+
+    {"type": "arrow", "id": "arrA", "x": 570, "y": 130, "width": 0, "height": 20, "angle": 0, "strokeColor": "#1e1e1e", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": {"type": 2}, "seed": 4, "version": 1, "versionNonce": 4, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false, "points": [[0, 0], [0, 20]], "lastCommittedPoint": null, "startBinding": null, "endBinding": null, "startArrowhead": null, "endArrowhead": "arrow"},
+
+    {
+      "type": "rectangle", "id": "boxB", "x": 120, "y": 150, "width": 900, "height": 98, "angle": 0,
+      "strokeColor": "#1971c2", "backgroundColor": "#a5d8ff", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": {"type": 3},
+      "seed": 5, "version": 1, "versionNonce": 5, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false
+    },
+    {
+      "type": "text", "id": "txtB", "x": 140, "y": 158, "width": 860, "height": 82, "angle": 0,
+      "strokeColor": "#1e1e1e", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": null,
+      "seed": 6, "version": 1, "versionNonce": 6, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false,
+      "text": "② 预处理（每 view，共 241×4 张）\nimg → crop[162:737, 0:1100] → (575, 1100, 3)\nB-mode = [:, :590] → (575, 590, 3) ｜ ULM = [:, 590:] → (575, 510, 3)，ULM 右侧 10% 置零\npad_sq 补零成方形 → resize(224,224) → BGR→RGB, /255 → ImageNet normalize → (3, 224, 224)",
+      "fontSize": 15, "fontFamily": 5, "textAlign": "left", "verticalAlign": "top", "baseline": 76,
+      "containerId": null,
+      "originalText": "② 预处理（每 view，共 241×4 张）\nimg → crop[162:737, 0:1100] → (575, 1100, 3)\nB-mode = [:, :590] → (575, 590, 3) ｜ ULM = [:, 590:] → (575, 510, 3)，ULM 右侧 10% 置零\npad_sq 补零成方形 → resize(224,224) → BGR→RGB, /255 → ImageNet normalize → (3, 224, 224)",
+      "lineHeight": 1.25
+    },
+
+    {"type": "arrow", "id": "arrB", "x": 570, "y": 248, "width": 0, "height": 20, "angle": 0, "strokeColor": "#1e1e1e", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": {"type": 2}, "seed": 7, "version": 1, "versionNonce": 7, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false, "points": [[0, 0], [0, 20]], "lastCommittedPoint": null, "startBinding": null, "endBinding": null, "startArrowhead": null, "endArrowhead": "arrow"},
+
+    {
+      "type": "rectangle", "id": "boxC", "x": 120, "y": 268, "width": 900, "height": 118, "angle": 0,
+      "strokeColor": "#2f9e44", "backgroundColor": "#b2f2bb", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": {"type": 3},
+      "seed": 8, "version": 1, "versionNonce": 8, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false
+    },
+    {
+      "type": "text", "id": "txtC", "x": 140, "y": 276, "width": 860, "height": 102, "angle": 0,
+      "strokeColor": "#1e1e1e", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": null,
+      "seed": 9, "version": 1, "versionNonce": 9, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false,
+      "text": "③ BiomedCLIP ViT-B/16（冻结 86M 参数，一次性离线提取，extract_biomedclip_features.py）\nencode_image(3,224,224) → 512D / view（L2 normalize）\n4 views 取均值 → B-mode 512D、ULM 512D → concat → 1024D / session\n保存：biomedclip_features.npz  X:(241, 1024)  y:(241,)\n另：vascular_features.npz  X_vasc:(241, 54)，取 X_vasc[:,0]=vessel_density → (241,)",
+      "fontSize": 15, "fontFamily": 5, "textAlign": "left", "verticalAlign": "top", "baseline": 96,
+      "containerId": null,
+      "originalText": "③ BiomedCLIP ViT-B/16（冻结 86M 参数，一次性离线提取，extract_biomedclip_features.py）\nencode_image(3,224,224) → 512D / view（L2 normalize）\n4 views 取均值 → B-mode 512D、ULM 512D → concat → 1024D / session\n保存：biomedclip_features.npz  X:(241, 1024)  y:(241,)\n另：vascular_features.npz  X_vasc:(241, 54)，取 X_vasc[:,0]=vessel_density → (241,)",
+      "lineHeight": 1.25
+    },
+
+    {"type": "arrow", "id": "arrC", "x": 570, "y": 386, "width": 0, "height": 20, "angle": 0, "strokeColor": "#1e1e1e", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": {"type": 2}, "seed": 10, "version": 1, "versionNonce": 10, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false, "points": [[0, 0], [0, 20]], "lastCommittedPoint": null, "startBinding": null, "endBinding": null, "startArrowhead": null, "endArrowhead": "arrow"},
+
+    {
+      "type": "rectangle", "id": "boxD", "x": 120, "y": 406, "width": 900, "height": 80, "angle": 0,
+      "strokeColor": "#f08c00", "backgroundColor": "#ffec99", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": {"type": 3},
+      "seed": 11, "version": 1, "versionNonce": 11, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false
+    },
+    {
+      "type": "text", "id": "txtD", "x": 140, "y": 414, "width": 860, "height": 64, "angle": 0,
+      "strokeColor": "#1e1e1e", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": null,
+      "seed": 12, "version": 1, "versionNonce": 12, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false,
+      "text": "④ 输入重塑（hybrid.py __main__，简化版：同一 512D 复制到 4 个 view）\nX_bc[:, :512].unsqueeze(1).expand(-1,4,-1) → bmode_feats (241, 4, 512)\nX_bc[:, 512:] 同理 → ulm_feats (241, 4, 512)；density → (241,4)；batch B=32",
+      "fontSize": 15, "fontFamily": 5, "textAlign": "left", "verticalAlign": "top", "baseline": 57,
+      "containerId": null,
+      "originalText": "④ 输入重塑（hybrid.py __main__，简化版：同一 512D 复制到 4 个 view）\nX_bc[:, :512].unsqueeze(1).expand(-1,4,-1) → bmode_feats (241, 4, 512)\nX_bc[:, 512:] 同理 → ulm_feats (241, 4, 512)；density → (241,4)；batch B=32",
+      "lineHeight": 1.25
+    },
+
+    {"type": "arrow", "id": "arrD", "x": 570, "y": 486, "width": 0, "height": 20, "angle": 0, "strokeColor": "#1e1e1e", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": {"type": 2}, "seed": 13, "version": 1, "versionNonce": 13, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false, "points": [[0, 0], [0, 20]], "lastCommittedPoint": null, "startBinding": null, "endBinding": null, "startArrowhead": null, "endArrowhead": "arrow"},
+
+    {
+      "type": "rectangle", "id": "boxE", "x": 120, "y": 506, "width": 900, "height": 80, "angle": 0,
+      "strokeColor": "#f08c00", "backgroundColor": "#ffec99", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": {"type": 3},
+      "seed": 14, "version": 1, "versionNonce": 14, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false
+    },
+    {
+      "type": "text", "id": "txtE", "x": 140, "y": 514, "width": 860, "height": 64, "angle": 0,
+      "strokeColor": "#1e1e1e", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": null,
+      "seed": 15, "version": 1, "versionNonce": 15, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false,
+      "text": "⑤ 双路投影（VascMambaHybrid.forward, d_model=32）\nbmode_proj = Linear(512→32)+LayerNorm+GELU：(B,4,512) → (B,4,32)\nulm_proj   = Linear(512→32)+LayerNorm+GELU：(B,4,512) → (B,4,32)",
+      "fontSize": 15, "fontFamily": 5, "textAlign": "left", "verticalAlign": "top", "baseline": 57,
+      "containerId": null,
+      "originalText": "⑤ 双路投影（VascMambaHybrid.forward, d_model=32）\nbmode_proj = Linear(512→32)+LayerNorm+GELU：(B,4,512) → (B,4,32)\nulm_proj   = Linear(512→32)+LayerNorm+GELU：(B,4,512) → (B,4,32)",
+      "lineHeight": 1.25
+    },
+
+    {"type": "arrow", "id": "arrE", "x": 570, "y": 586, "width": 0, "height": 20, "angle": 0, "strokeColor": "#1e1e1e", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": {"type": 2}, "seed": 16, "version": 1, "versionNonce": 16, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false, "points": [[0, 0], [0, 20]], "lastCommittedPoint": null, "startBinding": null, "endBinding": null, "startArrowhead": null, "endArrowhead": "arrow"},
+
+    {
+      "type": "rectangle", "id": "boxF", "x": 120, "y": 606, "width": 900, "height": 100, "angle": 0,
+      "strokeColor": "#f08c00", "backgroundColor": "#ffec99", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": {"type": 3},
+      "seed": 17, "version": 1, "versionNonce": 17, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false
+    },
+    {
+      "type": "text", "id": "txtF", "x": 140, "y": 614, "width": 860, "height": 84, "angle": 0,
+      "strokeColor": "#1e1e1e", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": null,
+      "seed": 18, "version": 1, "versionNonce": 18, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false,
+      "text": "⑥ Vessel-guided 排序 + 序列拼装\nu_tokens 按 density 降序 gather 重排：(B,4,32)（主流程中 4 个 density 相同 → 恒等排序）\n交错拼接 [B1,U1,B2,U2,B3,U3,B4,U4] → tokens (B, 8, 32)\n+ mod_emb(1,2,32)[0,1,0,1,0,1,0,1]（偶=B-mode, 奇=ULM） + pos_emb(1,8,32) → (B, 8, 32)",
+      "fontSize": 15, "fontFamily": 5, "textAlign": "left", "verticalAlign": "top", "baseline": 76,
+      "containerId": null,
+      "originalText": "⑥ Vessel-guided 排序 + 序列拼装\nu_tokens 按 density 降序 gather 重排：(B,4,32)（主流程中 4 个 density 相同 → 恒等排序）\n交错拼接 [B1,U1,B2,U2,B3,U3,B4,U4] → tokens (B, 8, 32)\n+ mod_emb(1,2,32)[0,1,0,1,0,1,0,1]（偶=B-mode, 奇=ULM） + pos_emb(1,8,32) → (B, 8, 32)",
+      "lineHeight": 1.25
+    },
+
+    {"type": "arrow", "id": "arrF", "x": 570, "y": 706, "width": 0, "height": 20, "angle": 0, "strokeColor": "#1e1e1e", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": {"type": 2}, "seed": 19, "version": 1, "versionNonce": 19, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false, "points": [[0, 0], [0, 20]], "lastCommittedPoint": null, "startBinding": null, "endBinding": null, "startArrowhead": null, "endArrowhead": "arrow"},
+
+    {
+      "type": "rectangle", "id": "boxG", "x": 120, "y": 726, "width": 900, "height": 210, "angle": 0,
+      "strokeColor": "#f08c00", "backgroundColor": "#ffec99", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": {"type": 3},
+      "seed": 20, "version": 1, "versionNonce": 20, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false
+    },
+    {
+      "type": "text", "id": "txtG", "x": 140, "y": 734, "width": 860, "height": 194, "angle": 0,
+      "strokeColor": "#1e1e1e", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": null,
+      "seed": 21, "version": 1, "versionNonce": 21, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false,
+      "text": "⑦ MambaBlock ×1（d_model=32, d_state=4, d_conv=2, expand=2, d_inner=64）\nx = x + SSM(LN(x))；x = x + FFN(LN(x))，FFN: 32→128→GELU→32\nSelectiveSSM 内部：\n  in_proj: (B,8,32)→(B,8,128) → chunk → x_in, z 各 (B,8,64)\n  depthwise Conv1d(64, k=2, pad=1) → 截断 :8 → SiLU：(B,8,64)\n  x_proj: (B,8,64)→(B,8,9) → B_ssm (B,8,4), C_ssm (B,8,4)；dt = softplus(dt_proj)：(B,8,1)\n  A = −exp(A_log)：(4,)；Ā = exp(dt·A)：(B,8,1,4)；B̄ = dt·B·x：(B,8,64,4)\n  逐步扫描 t=0..7：h(B,64,4) = Ā_t·h + B̄_t；y_t = (h·C_t).sum(-1) → (B,64)\n  y_scan (B,8,64) ⊙ SiLU(z) → out_proj(64→32) → (B,8,32)",
+      "fontSize": 15, "fontFamily": 5, "textAlign": "left", "verticalAlign": "top", "baseline": 187,
+      "containerId": null,
+      "originalText": "⑦ MambaBlock ×1（d_model=32, d_state=4, d_conv=2, expand=2, d_inner=64）\nx = x + SSM(LN(x))；x = x + FFN(LN(x))，FFN: 32→128→GELU→32\nSelectiveSSM 内部：\n  in_proj: (B,8,32)→(B,8,128) → chunk → x_in, z 各 (B,8,64)\n  depthwise Conv1d(64, k=2, pad=1) → 截断 :8 → SiLU：(B,8,64)\n  x_proj: (B,8,64)→(B,8,9) → B_ssm (B,8,4), C_ssm (B,8,4)；dt = softplus(dt_proj)：(B,8,1)\n  A = −exp(A_log)：(4,)；Ā = exp(dt·A)：(B,8,1,4)；B̄ = dt·B·x：(B,8,64,4)\n  逐步扫描 t=0..7：h(B,64,4) = Ā_t·h + B̄_t；y_t = (h·C_t).sum(-1) → (B,64)\n  y_scan (B,8,64) ⊙ SiLU(z) → out_proj(64→32) → (B,8,32)",
+      "lineHeight": 1.25
+    },
+
+    {"type": "arrow", "id": "arrG", "x": 570, "y": 936, "width": 0, "height": 20, "angle": 0, "strokeColor": "#1e1e1e", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": {"type": 2}, "seed": 22, "version": 1, "versionNonce": 22, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false, "points": [[0, 0], [0, 20]], "lastCommittedPoint": null, "startBinding": null, "endBinding": null, "startArrowhead": null, "endArrowhead": "arrow"},
+
+    {
+      "type": "rectangle", "id": "boxH", "x": 120, "y": 956, "width": 900, "height": 80, "angle": 0,
+      "strokeColor": "#f08c00", "backgroundColor": "#ffec99", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": {"type": 3},
+      "seed": 23, "version": 1, "versionNonce": 23, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false
+    },
+    {
+      "type": "text", "id": "txtH", "x": 140, "y": 964, "width": 860, "height": 64, "angle": 0,
+      "strokeColor": "#1e1e1e", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": null,
+      "seed": 24, "version": 1, "versionNonce": 24, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false,
+      "text": "⑧ 池化 + 分类头\nmean over sequence dim：(B,8,32) → (B,32)\nhead = LayerNorm → Linear(32→32)+GELU+Dropout(0.3) → Linear(32→2) → logits (B, 2)",
+      "fontSize": 15, "fontFamily": 5, "textAlign": "left", "verticalAlign": "top", "baseline": 57,
+      "containerId": null,
+      "originalText": "⑧ 池化 + 分类头\nmean over sequence dim：(B,8,32) → (B,32)\nhead = LayerNorm → Linear(32→32)+GELU+Dropout(0.3) → Linear(32→2) → logits (B, 2)",
+      "lineHeight": 1.25
+    },
+
+    {"type": "arrow", "id": "arrH", "x": 570, "y": 1036, "width": 0, "height": 20, "angle": 0, "strokeColor": "#1e1e1e", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": {"type": 2}, "seed": 25, "version": 1, "versionNonce": 25, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false, "points": [[0, 0], [0, 20]], "lastCommittedPoint": null, "startBinding": null, "endBinding": null, "startArrowhead": null, "endArrowhead": "arrow"},
+
+    {
+      "type": "rectangle", "id": "boxI", "x": 120, "y": 1056, "width": 900, "height": 118, "angle": 0,
+      "strokeColor": "#e03131", "backgroundColor": "#ffc9c9", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": {"type": 3},
+      "seed": 26, "version": 1, "versionNonce": 26, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false
+    },
+    {
+      "type": "text", "id": "txtI", "x": 140, "y": 1064, "width": 860, "height": 102, "angle": 0,
+      "strokeColor": "#1e1e1e", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2,
+      "roughness": 1, "opacity": 100, "groupIds": [], "frameId": null, "roundness": null,
+      "seed": 27, "version": 1, "versionNonce": 27, "isDeleted": false, "boundElements": null, "updated": 1, "link": null, "locked": false,
+      "text": "⑨ 训练 / 推理\nloss = CrossEntropyLoss(weight=[3.0, 1.0])（恶性:良性 = 3:1 类权重）\nAdamW(lr=5e-4, wd=5e-3) + CosineAnnealingLR + grad clip 2.0；100 epochs，early stop patience=20\n验证：softmax[:,1] → 阈值搜索 [0.05, 0.95) step 0.02 取 F1 最大 → acc/auc/recall/f1\n5-fold StratifiedKFold(seed=42) 取均值 → ACC 87.98%（baseline：BC-SVM 85.48%）",
+      "fontSize": 15, "fontFamily": 5, "textAlign": "left", "verticalAlign": "top", "baseline": 96,
+      "containerId": null,
+      "originalText": "⑨ 训练 / 推理\nloss = CrossEntropyLoss(weight=[3.0, 1.0])（恶性:良性 = 3:1 类权重）\nAdamW(lr=5e-4, wd=5e-3) + CosineAnnealingLR + grad clip 2.0；100 epochs，early stop patience=20\n验证：softmax[:,1] → 阈值搜索 [0.05, 0.95) step 0.02 取 F1 最大 → acc/auc/recall/f1\n5-fold StratifiedKFold(seed=42) 取均值 → ACC 87.98%（baseline：BC-SVM 85.48%）",
+      "lineHeight": 1.25
+    },
+
+    {
+      "type": "text",
+      "id": "legend",
+      "x": 120,
+      "y": 1210,
+      "width": 900,
+      "height": 60,
+      "angle": 0,
+      "strokeColor": "#868e96",
+      "backgroundColor": "transparent",
+      "fillStyle": "solid",
+      "strokeWidth": 1,
+      "roughness": 1,
+      "opacity": 100,
+      "groupIds": [],
+      "frameId": null,
+      "roundness": null,
+      "seed": 28,
+      "version": 1,
+      "versionNonce": 28,
+      "isDeleted": false,
+      "boundElements": null,
+      "updated": 1,
+      "link": null,
+      "locked": false,
+      "text": "颜色：蓝=数据/预处理  绿=冻结 BiomedCLIP（离线一次性）  黄=可训练 Mamba head（~50K）  红=训练/推理\n变体：每 view 独立特征见 hybrid_perview.py（biomedclip_perview_features.npz (241,8,512)，density 真实逐 view）；多尺度见 pyramid_vascmamba.py",
+      "fontSize": 13,
+      "fontFamily": 5,
+      "textAlign": "left",
+      "verticalAlign": "top",
+      "baseline": 50,
+      "containerId": null,
+      "originalText": "颜色：蓝=数据/预处理  绿=冻结 BiomedCLIP（离线一次性）  黄=可训练 Mamba head（~50K）  红=训练/推理\n变体：每 view 独立特征见 hybrid_perview.py（biomedclip_perview_features.npz (241,8,512)，density 真实逐 view）；多尺度见 pyramid_vascmamba.py",
+      "lineHeight": 1.25
+    }
+  ],
+  "appState": {
+    "viewBackgroundColor": "#ffffff",
+    "gridSize": 20
+  },
+  "files": {}
+}
