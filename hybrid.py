@@ -1,362 +1,584 @@
-"""VascMamba-Hybrid: BiomedCLIP(frozen) features + VascMamba lightweight head.
+"""Rigorous VascMamba-Hybrid training on real per-view BiomedCLIP features.
 
-Architecture innovation preserved: vessel-guided sequence ordering fed into Mamba SSM.
-BUT features are from frozen BiomedCLIP — no end-to-end pixel training.
+The original experiment expanded one session-averaged B-mode embedding and one
+session-averaged ULM embedding into four identical "views".  This entry point
+requires genuine per-view features instead and evaluates them with nested
+cross-validation: the outer fold is never used for early stopping or threshold
+selection.
 """
-import sys, os, numpy as np
-sys.path.insert(0, '/root/medic_data'); sys.path.insert(0, '/root/medic_data/ulm_visionnet')
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import math
+import random
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    matthews_corrcoef,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import accuracy_score, recall_score, roc_auc_score, f1_score
-import math
-from tqdm import tqdm
+from torch.utils.data import DataLoader, Dataset
+
 
 SEED = 42
-torch.manual_seed(SEED); np.random.seed(SEED)
-if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED)
-DEVICE = torch.device('cuda')
-
-CROP_Y1, CROP_Y2, CROP_X, SPLIT_X = 162, 737, 1100, 590
-
-from data.patient_index_v2 import build_unified_index
 
 
-# ═══════════════════════════════════════════════════════
-# Lightweight Selective SSM (same as before)
-# ═══════════════════════════════════════════════════════
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 
 class SelectiveSSM(nn.Module):
-    def __init__(self, d_model=128, d_state=8, d_conv=4, expand=2):
+    """Small selective state-space layer for short per-view sequences.
+
+    This remains a lightweight research implementation rather than the official
+    ``mamba_ssm`` kernel.  Unlike the previous version, every declared parameter
+    contributes to the forward pass: ``D`` supplies the direct skip term and the
+    formerly ignored extra ``x_proj`` channel now modulates delta. Parameter
+    shapes stay compatible with historical Hybrid checkpoints.
+    """
+
+    def __init__(self, d_model: int = 32, d_state: int = 4, d_conv: int = 2,
+                 expand: int = 2):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
-        d_inner = int(expand * d_model)
+        self.d_inner = int(expand * d_model)
 
-        self.in_proj = nn.Linear(d_model, d_inner * 2)
-        self.conv1d = nn.Conv1d(d_inner, d_inner, d_conv, padding=d_conv-1, groups=d_inner)
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2)
+        self.conv1d = nn.Conv1d(
+            self.d_inner,
+            self.d_inner,
+            d_conv,
+            padding=d_conv - 1,
+            groups=self.d_inner,
+        )
         self.act = nn.SiLU()
-        self.x_proj = nn.Linear(d_inner, d_state * 2 + 1)
-        self.dt_proj = nn.Linear(d_inner, 1)
+        self.x_proj = nn.Linear(self.d_inner, d_state * 2 + 1)
+        self.dt_proj = nn.Linear(self.d_inner, 1)
 
-        A = torch.arange(1, d_state + 1, dtype=torch.float32).view(1, d_state)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.D = nn.Parameter(torch.ones(d_inner))
-        self.out_proj = nn.Linear(d_inner, d_model)
+        a = torch.arange(1, d_state + 1, dtype=torch.float32).view(1, d_state)
+        self.A_log = nn.Parameter(torch.log(a))
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+        self.out_proj = nn.Linear(self.d_inner, d_model)
 
-    def forward(self, x):
-        B, L, D = x.shape
-        xz = self.in_proj(x)
-        x_in, z = xz.chunk(2, dim=-1)
-        x_conv = self.conv1d(x_in.transpose(1, 2))
-        x_conv = x_conv[:, :, :L]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, length, _ = x.shape
+        x_in, z = self.in_proj(x).chunk(2, dim=-1)
+        x_conv = self.conv1d(x_in.transpose(1, 2))[:, :, :length]
         x_conv = self.act(x_conv).transpose(1, 2)
 
-        x_proj = self.x_proj(x_conv)
-        B_ssm = x_proj[..., :self.d_state]
-        C_ssm = x_proj[..., self.d_state:2*self.d_state]
-        dt = F.softplus(self.dt_proj(x_conv))
+        projected = self.x_proj(x_conv)
+        b_ssm = projected[..., :self.d_state]
+        c_ssm = projected[..., self.d_state:2 * self.d_state]
+        dt_residual = projected[..., 2 * self.d_state:]
+        dt = F.softplus(self.dt_proj(x_conv) + dt_residual)
 
-        # Sequential scan (fast enough for 8 tokens)
-        B_seq, L_seq, D_seq = x_conv.shape
-        A = -torch.exp(self.A_log)  # (state,)
-        A = A.view(1, 1, 1, -1)  # allow broadcast with (B, L, 1, 1)
-        A_bar = torch.exp(dt.unsqueeze(-1) * A)  # (B, L, 1, state)
-        dt_exp = dt.unsqueeze(-1)  # dt already (B,L,1), need (B,L,1,1)
-        B_exp = B_ssm.unsqueeze(2)  # (B,L,1,state)
-        x_exp = x_conv.unsqueeze(-1)  # (B,L,d_inner,1)
-        B_bar_seq = dt_exp * B_exp * x_exp  # (B,L,d_inner,state)
+        # A is shared across inner channels to preserve legacy checkpoint shapes.
+        a = -torch.exp(self.A_log).to(dtype=x.dtype)
+        a_bar = torch.exp(dt.unsqueeze(-1) * a.unsqueeze(0).unsqueeze(0))
+        b_bar = (
+            dt.unsqueeze(-1)
+            * b_ssm.unsqueeze(2)
+            * x_conv.unsqueeze(-1)
+        )
 
-        h = torch.zeros(B_seq, D_seq, self.d_state, device=x.device)
+        h = x.new_zeros(batch, self.d_inner, self.d_state)
         outputs = []
-        for t in range(L_seq):
-            a_t = A_bar[:, t, 0]  # (B, state)
-            h = a_t.unsqueeze(1) * h + B_bar_seq[:, t]
-            y = (h * C_ssm[:, t].unsqueeze(1)).sum(-1)
-            outputs.append(y)
-        y_scan = torch.stack(outputs, dim=1)
-        y_out = y_scan * self.act(z)
-        return self.out_proj(y_out)
+        for t in range(length):
+            h = a_bar[:, t] * h + b_bar[:, t]
+            outputs.append((h * c_ssm[:, t].unsqueeze(1)).sum(dim=-1))
+
+        y = torch.stack(outputs, dim=1)
+        y = y + x_conv * self.D.to(dtype=x.dtype)
+        y = y * self.act(z)
+        return self.out_proj(y)
 
 
 class MambaBlock(nn.Module):
-    def __init__(self, d_model=128, d_state=8, d_conv=2, expand=2):
+    def __init__(self, d_model: int = 32, d_state: int = 4, d_conv: int = 2,
+                 expand: int = 2):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
         self.ssm = SelectiveSSM(d_model, d_state, d_conv, expand)
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model), nn.GELU(),
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
             nn.Linear(4 * d_model, d_model),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.ssm(self.norm1(x))
-        x = x + self.ffn(self.norm2(x))
-        return x
+        return x + self.ffn(self.norm2(x))
 
-
-# ═══════════════════════════════════════════════════════
-# VascMamba Hybrid: BiomedCLIP features + Mamba head
-# ═══════════════════════════════════════════════════════
 
 class VascMambaHybrid(nn.Module):
-    def __init__(self, bc_dim=512, d_model=64, d_state=4, n_layers=2, n_views=4):
+    """Fuse four genuine paired B-mode/ULM view embeddings.
+
+    Density ordering is disabled by default because input order should only be
+    changed when the ordering hypothesis is explicitly under ablation.  When it
+    is enabled, B-mode, ULM, density and validity masks are sorted together so
+    modality pairing is preserved.
+    """
+
+    def __init__(self, bc_dim: int = 512, d_model: int = 32, d_state: int = 4,
+                 n_layers: int = 1, n_views: int = 4,
+                 order_by_density: bool = False):
         super().__init__()
         self.n_views = n_views
-        self.seq_len = n_views * 2  # 4 B-mode + 4 ULM = 8 tokens
+        self.seq_len = n_views * 2
+        self.order_by_density = order_by_density
 
-        # Feature projection: 512D → d_model
         self.bmode_proj = nn.Sequential(
             nn.Linear(bc_dim, d_model), nn.LayerNorm(d_model), nn.GELU()
         )
         self.ulm_proj = nn.Sequential(
             nn.Linear(bc_dim, d_model), nn.LayerNorm(d_model), nn.GELU()
         )
-
-        # Learnable position + modality embeddings
         self.pos_emb = nn.Parameter(torch.randn(1, self.seq_len, d_model) * 0.02)
-        self.mod_emb = nn.Parameter(torch.zeros(1, 2, d_model))  # 0=B-mode, 1=ULM
+        self.mod_emb = nn.Parameter(torch.zeros(1, 2, d_model))
+        self.register_buffer(
+            "mod_ids", torch.tensor([0, 1] * n_views, dtype=torch.long),
+            persistent=False,
+        )
 
-        # Mamba layers
-        self.mamba = nn.ModuleList([
-            MambaBlock(d_model, d_state, d_conv=2, expand=2) for _ in range(n_layers)
-        ])
-
-        # Head
+        self.mamba = nn.ModuleList(
+            [MambaBlock(d_model, d_state, d_conv=2, expand=2)
+             for _ in range(n_layers)]
+        )
         self.head = nn.Sequential(
             nn.LayerNorm(d_model),
-            nn.Linear(d_model, 32), nn.GELU(), nn.Dropout(0.3),
+            nn.Linear(d_model, 32),
+            nn.GELU(),
+            nn.Dropout(0.3),
             nn.Linear(32, 2),
         )
 
-    def forward(self, bmode_feats, ulm_feats, ulm_density=None):
-        """
-        bmode_feats: (B, 4, 512) — 4 B-mode views
-        ulm_feats:   (B, 4, 512) — 4 ULM views
-        ulm_density: (B, 4) — vessel density per ULM view (for ordering), optional
-        Returns: logits (B, 2)
-        """
-        B = bmode_feats.shape[0]
+    def _validate_inputs(self, bmode_feats: torch.Tensor,
+                         ulm_feats: torch.Tensor,
+                         ulm_density: torch.Tensor | None,
+                         view_mask: torch.Tensor | None) -> None:
+        expected = (bmode_feats.shape[0], self.n_views)
+        if bmode_feats.ndim != 3 or ulm_feats.shape != bmode_feats.shape:
+            raise ValueError("B-mode and ULM features must both have shape (B,V,D)")
+        if bmode_feats.shape[1] != self.n_views:
+            raise ValueError(f"expected {self.n_views} views, got {bmode_feats.shape[1]}")
+        if ulm_density is not None and ulm_density.shape != expected:
+            raise ValueError("density must have shape (B,V)")
+        if view_mask is not None and view_mask.shape != expected:
+            raise ValueError("view_mask must have shape (B,V)")
 
-        # Project to d_model
-        b_tokens = self.bmode_proj(bmode_feats)  # (B, 4, d)
-        u_tokens = self.ulm_proj(ulm_feats)      # (B, 4, d)
+    def forward(self, bmode_feats: torch.Tensor, ulm_feats: torch.Tensor,
+                ulm_density: torch.Tensor | None = None,
+                view_mask: torch.Tensor | None = None) -> torch.Tensor:
+        self._validate_inputs(bmode_feats, ulm_feats, ulm_density, view_mask)
+        batch = bmode_feats.shape[0]
+        if view_mask is None:
+            view_mask = torch.ones(
+                batch, self.n_views, device=bmode_feats.device, dtype=torch.bool
+            )
 
-        # Order ULM tokens by vessel density if provided (vessel-guided ordering)
-        if ulm_density is not None:
-            _, sort_idx = ulm_density.sort(dim=1, descending=True)
-            u_tokens = u_tokens.gather(1, sort_idx.unsqueeze(-1).expand(-1, -1, u_tokens.shape[-1]))
+        if self.order_by_density:
+            if ulm_density is None:
+                raise ValueError("density is required when order_by_density=True")
+            sort_idx = ulm_density.argsort(dim=1, descending=True)
+            feat_idx = sort_idx.unsqueeze(-1).expand_as(bmode_feats)
+            bmode_feats = bmode_feats.gather(1, feat_idx)
+            ulm_feats = ulm_feats.gather(1, feat_idx)
+            ulm_density = ulm_density.gather(1, sort_idx)
+            view_mask = view_mask.gather(1, sort_idx)
 
-        # Interleave or concatenate:  B1, U1, B2, U2, B3, U3, B4, U4
-        tokens = []
-        for v in range(self.n_views):
-            tokens.append(b_tokens[:, v:v+1])
-            tokens.append(u_tokens[:, v:v+1])
-        tokens = torch.cat(tokens, dim=1)  # (B, 8, d)
+        b_tokens = self.bmode_proj(bmode_feats)
+        u_tokens = self.ulm_proj(ulm_feats)
+        tokens = torch.stack((b_tokens, u_tokens), dim=2).flatten(1, 2)
+        token_mask = view_mask.unsqueeze(-1).expand(-1, -1, 2).flatten(1, 2)
 
-        # Add modality embeddings: even positions=0 (B-mode), odd=1 (ULM)
-        mod_ids = torch.tensor([0, 1, 0, 1, 0, 1, 0, 1], device=tokens.device).long()
-        tokens = tokens + self.mod_emb[0, mod_ids].unsqueeze(0)
+        tokens = tokens + self.mod_emb[0, self.mod_ids].unsqueeze(0)
         tokens = tokens + self.pos_emb
-
-        # Mamba encoding
+        tokens = tokens * token_mask.unsqueeze(-1).to(tokens.dtype)
         for layer in self.mamba:
             tokens = layer(tokens)
+            tokens = tokens * token_mask.unsqueeze(-1).to(tokens.dtype)
 
-        # Mean pool over sequence
-        pooled = tokens.mean(dim=1)  # (B, d)
+        denom = token_mask.sum(dim=1, keepdim=True).clamp_min(1).to(tokens.dtype)
+        pooled = tokens.sum(dim=1) / denom
         return self.head(pooled)
 
 
-# ═══════════════════════════════════════════════════════
-# Feature extraction: BiomedCLIP per-view features
-# ═══════════════════════════════════════════════════════
+class FeatDataset(Dataset):
+    def __init__(self, bmode: torch.Tensor, ulm: torch.Tensor,
+                 density: torch.Tensor, labels: torch.Tensor,
+                 valid: torch.Tensor | None = None):
+        self.bmode = bmode
+        self.ulm = ulm
+        self.density = density
+        self.labels = labels
+        self.valid = torch.ones_like(density, dtype=torch.bool) if valid is None else valid.bool()
 
-import cv2
+    def __len__(self) -> int:
+        return len(self.labels)
 
-def pad_sq(im):
-    h, w = im.shape[:2]; s = max(h, w)
-    top = (s-h)//2; bot = s-h-top; lft = (s-w)//2; rgt = s-w-lft
-    return cv2.copyMakeBorder(im, top, bot, lft, rgt, cv2.BORDER_CONSTANT, value=0)
+    def __getitem__(self, index: int):
+        return (
+            self.bmode[index], self.ulm[index], self.density[index],
+            self.valid[index], self.labels[index],
+        )
 
-def preprocess_for_bc(img):
-    resized = cv2.resize(pad_sq(img), (224, 224), cv2.INTER_AREA)
-    rgb = resized.astype(np.float32)[..., ::-1] / 255.0
-    rgb = (rgb - np.array([0.485, 0.456, 0.406])) / np.array([0.229, 0.224, 0.225])
-    return torch.from_numpy(rgb).float().permute(2, 0, 1)
+
+@dataclass
+class TrainConfig:
+    d_model: int = 32
+    d_state: int = 4
+    n_layers: int = 1
+    order_by_density: bool = False
+    epochs: int = 100
+    batch_size: int = 32
+    lr: float = 5e-4
+    weight_decay: float = 5e-3
+    patience: int = 20
+
+
+def class_weights(labels: torch.Tensor, device: torch.device) -> torch.Tensor:
+    counts = torch.bincount(labels.long(), minlength=2).float()
+    if (counts == 0).any():
+        raise ValueError("both classes are required in each training split")
+    return (counts.sum() / (2.0 * counts)).to(device)
+
+
+def make_loader(bmode: torch.Tensor, ulm: torch.Tensor, density: torch.Tensor,
+                valid: torch.Tensor, labels: torch.Tensor, indices: np.ndarray,
+                batch_size: int, shuffle: bool) -> DataLoader:
+    ds = FeatDataset(
+        bmode[indices], ulm[indices], density[indices], labels[indices], valid[indices]
+    )
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
 
 
 @torch.no_grad()
-def extract_session_features(samples, bc_model):
-    """Extract per-view BiomedCLIP features + vessel density per view."""
-    all_bmode, all_ulm, all_density, all_labels = [], [], [], []
-    for s in tqdm(samples, desc='Extracting BC features'):
-        b_views, u_views, densities = [], [], []
-        for vf in s['views']:
-            path = os.path.join(s['patient_dir'], vf)
-            img = cv2.imread(path)
-            if img is None:
-                b_views.append(torch.zeros(512))
-                u_views.append(torch.zeros(512))
-                densities.append(0.0)
-                continue
-
-            cropped = img[CROP_Y1:CROP_Y2, 0:CROP_X]
-            bm = cropped[:, :SPLIT_X]
-            um = cropped[:, SPLIT_X:]
-            um[:, -max(1, int(um.shape[1]*0.1)):] = 0
-
-            # BiomedCLIP features
-            bm_t = preprocess_for_bc(bm).unsqueeze(0).to(DEVICE)
-            um_t = preprocess_for_bc(um).unsqueeze(0).to(DEVICE)
-            b_views.append(bc_model.encode_image(bm_t, normalize=True).cpu()[0])
-            u_views.append(bc_model.encode_image(um_t, normalize=True).cpu()[0])
-
-            # Vessel density (for ordering)
-            gray = cv2.cvtColor(um, cv2.COLOR_BGR2GRAY)
-            _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            densities.append((otsu > 0).mean())
-
-        all_bmode.append(torch.stack(b_views))    # (4, 512)
-        all_ulm.append(torch.stack(u_views))       # (4, 512)
-        all_density.append(torch.tensor(densities))  # (4,)
-        all_labels.append(s['label'])
-
-    return (torch.stack(all_bmode), torch.stack(all_ulm),
-            torch.stack(all_density), torch.tensor(all_labels).long())
+def predict(model: nn.Module, loader: DataLoader, device: torch.device):
+    model.eval()
+    probabilities, labels = [], []
+    for bmode, ulm, density, valid, target in loader:
+        logits = model(
+            bmode.to(device), ulm.to(device), density.to(device), valid.to(device)
+        )
+        probabilities.append(logits.softmax(dim=-1)[:, 1].cpu())
+        labels.append(target)
+    return torch.cat(probabilities).numpy(), torch.cat(labels).numpy()
 
 
-# ═══════════════════════════════════════════════════════
-# Training
-# ═══════════════════════════════════════════════════════
+def select_f1_threshold(labels: np.ndarray, probabilities: np.ndarray) -> float:
+    thresholds = np.arange(0.05, 0.951, 0.01)
+    scores = [f1_score(labels, probabilities >= t, zero_division=0) for t in thresholds]
+    return float(thresholds[int(np.argmax(scores))])
 
-def train_hybrid(model, X_bmode, X_ulm, X_density, y, idx_train, idx_val,
-                 epochs=100, lr=5e-4, batch_size=32):
-    """Train VascMamba hybrid head."""
-    # Create data loaders from pre-extracted features
-    class FeatDataset(Dataset):
-        def __init__(self, bm, um, d, y):
-            self.bm, self.um, self.d, self.y = bm, um, d, y
-        def __len__(self): return len(self.y)
-        def __getitem__(self, i): return self.bm[i], self.um[i], self.d[i], self.y[i]
 
-    train_ds = FeatDataset(X_bmode[idx_train], X_ulm[idx_train], X_density[idx_train], y[idx_train])
-    val_ds = FeatDataset(X_bmode[idx_val], X_ulm[idx_val], X_density[idx_val], y[idx_val])
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+def classification_metrics(labels: np.ndarray, probabilities: np.ndarray,
+                           threshold: float) -> dict[str, float]:
+    pred = (probabilities >= threshold).astype(np.int64)
+    tn, fp, fn, tp = confusion_matrix(labels, pred, labels=[0, 1]).ravel()
+    return {
+        "threshold": threshold,
+        "accuracy": accuracy_score(labels, pred),
+        "balanced_accuracy": balanced_accuracy_score(labels, pred),
+        "roc_auc": roc_auc_score(labels, probabilities),
+        "pr_auc": average_precision_score(labels, probabilities),
+        "sensitivity": recall_score(labels, pred, pos_label=1, zero_division=0),
+        "specificity": tn / max(tn + fp, 1),
+        "f1": f1_score(labels, pred, zero_division=0),
+        "mcc": matthews_corrcoef(labels, pred),
+        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+    }
 
-    opt = AdamW(model.parameters(), lr=lr, weight_decay=5e-3)
-    sched = CosineAnnealingLR(opt, T_max=epochs * len(train_loader), eta_min=1e-6)
 
-    best_acc, best_metrics, patience = 0, None, 0
-    for ep in range(epochs):
+def fit_inner_split(model: VascMambaHybrid, bmode: torch.Tensor,
+                    ulm: torch.Tensor, density: torch.Tensor, valid: torch.Tensor,
+                    labels: torch.Tensor, train_idx: np.ndarray,
+                    val_idx: np.ndarray, config: TrainConfig,
+                    device: torch.device) -> tuple[VascMambaHybrid, float, dict]:
+    train_loader = make_loader(
+        bmode, ulm, density, valid, labels, train_idx,
+        config.batch_size, shuffle=True,
+    )
+    val_loader = make_loader(
+        bmode, ulm, density, valid, labels, val_idx,
+        config.batch_size, shuffle=False,
+    )
+    weights = class_weights(labels[train_idx], device)
+    optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    scheduler = CosineAnnealingLR(
+        optimizer, T_max=max(1, config.epochs * len(train_loader)), eta_min=1e-6
+    )
+
+    best_loss = math.inf
+    best_epoch = -1
+    best_state = copy.deepcopy(model.state_dict())
+    stale_epochs = 0
+    for epoch in range(config.epochs):
         model.train()
-        for bm, um, d, lbl in train_loader:
-            bm, um, d, lbl = bm.to(DEVICE), um.to(DEVICE), d.to(DEVICE), lbl.to(DEVICE)
-            opt.zero_grad()
-            logits = model(bm, um, d)
-            w = torch.tensor([3.0, 1.0], device=DEVICE)
-            loss = F.cross_entropy(logits, lbl, weight=w)
+        for b, u, d, mask, target in train_loader:
+            b, u, d = b.to(device), u.to(device), d.to(device)
+            mask, target = mask.to(device), target.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(b, u, d, mask)
+            loss = F.cross_entropy(logits, target, weight=weights)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
-            opt.step()
-            sched.step()
+            optimizer.step()
+            scheduler.step()
 
         model.eval()
-        probs, labels = [], []
+        val_loss_sum, n_val = 0.0, 0
         with torch.no_grad():
-            for bm, um, d, lbl in val_loader:
-                bm, um, d = bm.to(DEVICE), um.to(DEVICE), d.to(DEVICE)
-                logits = model(bm, um, d)
-                probs.append(F.softmax(logits, -1)[:, 1].cpu())
-                labels.append(lbl)
-        probs = torch.cat(probs).numpy(); labels = torch.cat(labels).numpy()
-
-        best_t, best_f1 = 0.5, 0
-        best_m = None
-        for t in np.arange(0.05, 0.95, 0.02):
-            pred = (probs >= t).astype(int)
-            f1v = f1_score(labels, pred, zero_division=0)
-            if f1v > best_f1:
-                best_f1 = f1v; best_t = t
-                best_m = {'acc': accuracy_score(labels, pred), 'auc': roc_auc_score(labels, probs),
-                           'recall': recall_score(labels, pred, zero_division=0), 'f1': f1v}
-
-        if best_m['acc'] > best_acc + 0.005:
-            best_acc = best_m['acc']; best_metrics = best_m; patience = 0
+            for b, u, d, mask, target in val_loader:
+                b, u, d = b.to(device), u.to(device), d.to(device)
+                mask, target = mask.to(device), target.to(device)
+                loss = F.cross_entropy(model(b, u, d, mask), target, weight=weights)
+                val_loss_sum += loss.item() * len(target)
+                n_val += len(target)
+        val_loss = val_loss_sum / max(n_val, 1)
+        if val_loss < best_loss - 1e-5:
+            best_loss = val_loss
+            best_epoch = epoch
+            best_state = copy.deepcopy(model.state_dict())
+            stale_epochs = 0
         else:
-            patience += 1
-        if patience > 20:
+            stale_epochs += 1
+        if stale_epochs > config.patience:
             break
 
-    return best_metrics
+    model.load_state_dict(best_state)
+    val_prob, val_labels = predict(model, val_loader, device)
+    threshold = select_f1_threshold(val_labels, val_prob)
+    diagnostics = {
+        "best_epoch": best_epoch,
+        "best_val_loss": best_loss,
+        "inner_metrics": classification_metrics(val_labels, val_prob, threshold),
+    }
+    return model, threshold, diagnostics
 
 
-if __name__ == '__main__':
-    print('=' * 70)
-    print('VascMamba-Hybrid: BiomedCLIP + Mamba head')
-    print('=' * 70)
+def nested_cross_validate(bmode: torch.Tensor, ulm: torch.Tensor,
+                          density: torch.Tensor, valid: torch.Tensor,
+                          labels: torch.Tensor, config: TrainConfig,
+                          output_dir: Path, device: torch.device,
+                          seed: int = SEED) -> list[dict]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    y_np = labels.numpy()
+    outer = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+    results = []
+    oof_probability = np.full(len(labels), np.nan, dtype=np.float32)
+    oof_fold = np.full(len(labels), -1, dtype=np.int64)
+    oof_threshold = np.full(len(labels), np.nan, dtype=np.float32)
 
-    # Load pre-extracted BiomedCLIP features (no need to reload model)
-    print('\n[2] Loading pre-extracted BiomedCLIP features...')
-    bc_data = np.load('/root/medic_data/biomedclip_features.npz')
-    X_bc = torch.from_numpy(bc_data['X']).float()  # (241, 1024) — B-mean(512) + U-mean(512)
-    y_all = torch.from_numpy(bc_data['y']).long()
+    for fold, (outer_train, outer_test) in enumerate(
+        outer.split(np.arange(len(labels)), y_np), start=1
+    ):
+        inner_split = StratifiedShuffleSplit(
+            n_splits=1, test_size=0.2, random_state=seed + fold
+        )
+        rel_train, rel_val = next(inner_split.split(outer_train, y_np[outer_train]))
+        inner_train = outer_train[rel_train]
+        inner_val = outer_train[rel_val]
 
-    # Reshape: (241, 1024) → bmode=(241, 512), ulm=(241, 512)
-    # BiomedCLIP features are stored as [B-mean(512), U-mean(512)]
-    X_bmode_full = X_bc[:, :512].unsqueeze(1).expand(-1, 4, -1)  # (241, 4, 512)
-    X_ulm_full = X_bc[:, 512:].unsqueeze(1).expand(-1, 4, -1)
+        seed_everything(seed + fold)
+        model = VascMambaHybrid(
+            d_model=config.d_model,
+            d_state=config.d_state,
+            n_layers=config.n_layers,
+            n_views=bmode.shape[1],
+            order_by_density=config.order_by_density,
+        ).to(device)
+        model, threshold, diagnostics = fit_inner_split(
+            model, bmode, ulm, density, valid, labels,
+            inner_train, inner_val, config, device,
+        )
+        test_loader = make_loader(
+            bmode, ulm, density, valid, labels, outer_test,
+            config.batch_size, shuffle=False,
+        )
+        probability, target = predict(model, test_loader, device)
+        oof_probability[outer_test] = probability
+        oof_fold[outer_test] = fold
+        oof_threshold[outer_test] = threshold
+        metrics = classification_metrics(target, probability, threshold)
+        metrics.update({"fold": fold, **diagnostics})
+        results.append(metrics)
 
-    # For vessel density ordering: use pre-computed vascular features
-    vasc_data = np.load('/root/medic_data/vascular_features.npz')
-    X_vasc = torch.from_numpy(vasc_data['X_vasc']).float()
-    # vessel_density is at feature index ~0 (vessel_density_mean)
-    # Use mean of vessel_density across 4 views as proxy
-    X_density_full = X_vasc[:, 0].unsqueeze(1).expand(-1, 4)  # (241, 4) — simplified
+        torch.save(
+            {
+                "state_dict": model.state_dict(),
+                "threshold": threshold,
+                "config": asdict(config),
+                "fold": fold,
+                "inner_train_indices": inner_train,
+                "inner_val_indices": inner_val,
+                "outer_test_indices": outer_test,
+            },
+            output_dir / f"fold_{fold}.pt",
+        )
+        print(
+            f"fold={fold} acc={metrics['accuracy']:.4f} "
+            f"bal_acc={metrics['balanced_accuracy']:.4f} "
+            f"auc={metrics['roc_auc']:.4f} f1={metrics['f1']:.4f} "
+            f"threshold={threshold:.2f}"
+        )
 
-    # Model size
-    model = VascMambaHybrid(d_model=32, d_state=4, n_layers=1)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'  Hybrid model: {n_params/1000:.0f}K params')
+    with (output_dir / "nested_cv_metrics.json").open("w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    if np.isnan(oof_probability).any() or (oof_fold < 0).any():
+        raise RuntimeError("outer cross-validation did not produce exactly one prediction per sample")
+    np.savez_compressed(
+        output_dir / "nested_cv_oof.npz",
+        y=y_np,
+        probability=oof_probability,
+        fold=oof_fold,
+        threshold=oof_threshold,
+    )
+    return results
 
-    # 5-fold CV
-    N = len(y_all)
-    print(f'\n[3] 5-Fold Training ({N} samples)...')
-    print(f'  B-mode: {X_bmode_full.shape}, ULM: {X_ulm_full.shape}, Density: {X_density_full.shape}')
-    y_np = y_all.numpy()
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
-    fold_results = []
 
-    for fi, (ti, vi) in enumerate(skf.split(np.arange(N), y_np)):
-        print(f'\n--- Fold {fi+1}/5 | Train={len(ti)} Val={len(vi)} ---')
+def train_hybrid(model, X_bmode, X_ulm, X_density, y, idx_train, idx_val,
+                 epochs=100, lr=5e-4, batch_size=32, X_valid=None):
+    """Compatibility wrapper for older experiment scripts.
 
-        m = VascMambaHybrid(d_model=32, d_state=4, n_layers=1).to(DEVICE)
-        n_train = sum(p.numel() for p in m.parameters() if p.requires_grad)
+    This function still evaluates its supplied validation indices, so it must
+    not be used to claim an unbiased test result.  New experiments should call
+    :func:`nested_cross_validate`.
+    """
+    valid = torch.ones_like(X_density, dtype=torch.bool) if X_valid is None else X_valid
+    config = TrainConfig(
+        d_model=model.head[1].in_features,
+        order_by_density=model.order_by_density,
+        epochs=epochs,
+        lr=lr,
+        batch_size=batch_size,
+    )
+    device = next(model.parameters()).device
+    model, threshold, _ = fit_inner_split(
+        model, X_bmode, X_ulm, X_density, valid, y,
+        np.asarray(idx_train), np.asarray(idx_val), config, device,
+    )
+    loader = make_loader(
+        X_bmode, X_ulm, X_density, valid, y, np.asarray(idx_val),
+        batch_size, shuffle=False,
+    )
+    probability, target = predict(model, loader, device)
+    metrics = classification_metrics(target, probability, threshold)
+    return {
+        "acc": metrics["accuracy"], "auc": metrics["roc_auc"],
+        "recall": metrics["sensitivity"], "f1": metrics["f1"],
+        "threshold": threshold,
+    }
 
-        metrics = train_hybrid(m, X_bmode_full, X_ulm_full, X_density_full, y_all,
-                                ti, vi, epochs=100, lr=5e-4)
-        fold_results.append(metrics)
 
-    # Summary
-    accs = [r['acc'] for r in fold_results]
-    aucs = [r['auc'] for r in fold_results]
-    print('\n' + '=' * 70)
-    print('VascMamba-Hybrid RESULTS')
-    print('=' * 70)
-    print(f'  Acc:    {np.mean(accs):.4f} ± {np.std(accs):.4f}')
-    print(f'  AUC:    {np.mean(aucs):.4f} ± {np.std(aucs):.4f}')
-    print(f'  Recall: {np.mean([r["recall"] for r in fold_results]):.4f}')
-    print(f'  F1:     {np.mean([r["f1"] for r in fold_results]):.4f}')
-    print(f'  Per-fold: {[f"{a:.3f}" for a in accs]}')
-    print(f'\n  BiomedCLIP SVM (baseline): 0.8548')
-    print(f'  VTG-Net v2:               0.8792')
-    print(f'  VascMamba raw pixel:      0.8081')
-    print(f'  VascMamba-Hybrid:         {np.mean(accs):.4f}')
+def load_per_view_features(path: Path):
+    data = np.load(path)
+    required = {"X_bmode", "X_ulm", "density", "y"}
+    missing = required.difference(data.files)
+    if missing:
+        raise KeyError(f"{path} is missing arrays: {sorted(missing)}")
+    bmode = torch.from_numpy(data["X_bmode"]).float()
+    ulm = torch.from_numpy(data["X_ulm"]).float()
+    density = torch.from_numpy(data["density"]).float()
+    labels = torch.from_numpy(data["y"]).long()
+    valid = (
+        torch.from_numpy(data["valid"]).bool()
+        if "valid" in data.files else torch.ones_like(density, dtype=torch.bool)
+    )
+    if bmode.ndim != 3 or bmode.shape != ulm.shape:
+        raise ValueError("X_bmode and X_ulm must have shape (N,V,512)")
+    if bmode.shape[:2] != density.shape or density.shape != valid.shape:
+        raise ValueError("density/valid must match the (N,V) feature dimensions")
+    if len(labels) != len(bmode):
+        raise ValueError("labels and feature arrays have different sample counts")
+    # Expanded session means are exactly identical along the view axis.  Refuse
+    # such files so the rigorous entry point cannot silently reproduce the old
+    # fake-token experiment.  Repeated B-mode alone is allowed because some ULM
+    # exports legitimately share one grayscale background.
+    b_repeated = (bmode - bmode[:, :1]).abs().amax(dim=(1, 2)) == 0
+    u_repeated = (ulm - ulm[:, :1]).abs().amax(dim=(1, 2)) == 0
+    d_repeated = (density - density[:, :1]).abs().amax(dim=1) == 0
+    fake_fraction = (b_repeated & u_repeated & d_repeated).float().mean().item()
+    if fake_fraction > 0.95:
+        raise ValueError(
+            "features appear to be expanded session means: more than 95% of "
+            "samples have identical B-mode, ULM and density values across views"
+        )
+    return bmode, ulm, density, valid, labels
+
+
+def summarize(results: list[dict]) -> None:
+    keys = [
+        "accuracy", "balanced_accuracy", "roc_auc", "pr_auc",
+        "sensitivity", "specificity", "f1", "mcc",
+    ]
+    print("\nNested outer-fold results (mean ± fold SD)")
+    for key in keys:
+        values = np.asarray([result[key] for result in results], dtype=float)
+        print(f"  {key:18s} {values.mean():.4f} ± {values.std():.4f}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--features", type=Path,
+        default=Path("/root/medic_data/biomedclip_perview_features.npz"),
+        help="NPZ with X_bmode/X_ulm=(N,V,512), density/valid=(N,V), y=(N,)",
+    )
+    parser.add_argument("--output-dir", type=Path, default=Path("hybrid_nested_outputs"))
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument(
+        "--order-by-density", action="store_true",
+        help="Ablation only: sort paired B-mode/ULM views by ULM density",
+    )
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    seed_everything(args.seed)
+    device = torch.device(args.device)
+    bmode, ulm, density, valid, labels = load_per_view_features(args.features)
+    config = TrainConfig(
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        order_by_density=args.order_by_density,
+    )
+    print(
+        f"samples={len(labels)} views={bmode.shape[1]} feature_dim={bmode.shape[2]} "
+        f"valid_views={int(valid.sum())}/{valid.numel()} device={device}"
+    )
+    results = nested_cross_validate(
+        bmode, ulm, density, valid, labels, config,
+        args.output_dir, device, seed=args.seed,
+    )
+    summarize(results)
+
+
+if __name__ == "__main__":
+    main()
