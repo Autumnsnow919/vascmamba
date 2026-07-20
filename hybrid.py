@@ -28,10 +28,11 @@ from sklearn.metrics import (
     confusion_matrix,
     f1_score,
     matthews_corrcoef,
+    precision_score,
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
+from sklearn.model_selection import StratifiedKFold
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
@@ -257,13 +258,28 @@ class TrainConfig:
     lr: float = 5e-4
     weight_decay: float = 5e-3
     patience: int = 20
+    inner_folds: int = 3
+    ensemble_size: int = 3
+    class_weight_power: float = 1.0
+    threshold_objective: str = "f1"
+    recall_floor: float = 0.90
 
 
-def class_weights(labels: torch.Tensor, device: torch.device) -> torch.Tensor:
+def class_weights(labels: torch.Tensor, device: torch.device,
+                  power: float = 1.0) -> torch.Tensor:
+    """Return softened inverse-frequency weights.
+
+    ``power=1`` exactly balances both classes, while ``power=0`` is ordinary
+    cross-entropy.  Intermediate values are available as an explicit ablation;
+    the default remains fully balanced for comparability with prior runs.
+    """
+    if not 0.0 <= power <= 1.0:
+        raise ValueError("class_weight_power must be in [0, 1]")
     counts = torch.bincount(labels.long(), minlength=2).float()
     if (counts == 0).any():
         raise ValueError("both classes are required in each training split")
-    return (counts.sum() / (2.0 * counts)).to(device)
+    balanced = counts.sum() / (2.0 * counts)
+    return balanced.pow(power).to(device)
 
 
 def make_loader(bmode: torch.Tensor, ulm: torch.Tensor, density: torch.Tensor,
@@ -288,27 +304,87 @@ def predict(model: nn.Module, loader: DataLoader, device: torch.device):
     return torch.cat(probabilities).numpy(), torch.cat(labels).numpy()
 
 
+def _threshold_candidates(probabilities: np.ndarray) -> np.ndarray:
+    """All decision boundaries that can change a prediction, plus 0.5."""
+    unique = np.unique(np.asarray(probabilities, dtype=float))
+    if len(unique) < 2:
+        return np.asarray([0.5], dtype=float)
+    midpoints = (unique[:-1] + unique[1:]) / 2.0
+    return np.unique(np.clip(np.r_[0.0, midpoints, 0.5, 1.0], 0.0, 1.0))
+
+
+def select_operating_threshold(labels: np.ndarray, probabilities: np.ndarray,
+                               objective: str = "clinical",
+                               recall_floor: float = 0.90) -> float:
+    """Select a threshold only from inner out-of-fold predictions.
+
+    ``clinical`` maximizes accuracy while requiring malignant sensitivity to
+    remain above ``recall_floor``.  Precision and F1 break ties.  This avoids
+    the previous behaviour where a tiny, single validation split could choose
+    a threshold below the all-malignant operating point.  Alternative
+    objectives are exposed for preregistered ablations.
+    """
+    if objective not in {"clinical", "f1", "balanced_accuracy"}:
+        raise ValueError(f"unknown threshold objective: {objective}")
+    if not 0.0 <= recall_floor <= 1.0:
+        raise ValueError("recall_floor must be in [0, 1]")
+
+    rows = []
+    for threshold in _threshold_candidates(probabilities):
+        metrics = classification_metrics(labels, probabilities, float(threshold))
+        rows.append(metrics)
+
+    if objective == "clinical":
+        feasible = [row for row in rows if row["sensitivity"] >= recall_floor]
+        pool = feasible or rows
+        key = lambda row: (
+            row["accuracy"], row["precision"], row["f1"],
+            row["sensitivity"], -abs(row["threshold"] - 0.5),
+        )
+    elif objective == "f1":
+        pool = rows
+        key = lambda row: (
+            row["f1"], row["accuracy"], row["precision"],
+            row["sensitivity"], -abs(row["threshold"] - 0.5),
+        )
+    else:
+        pool = rows
+        key = lambda row: (
+            row["balanced_accuracy"], row["f1"], row["accuracy"],
+            -abs(row["threshold"] - 0.5),
+        )
+    return float(max(pool, key=key)["threshold"])
+
+
 def select_f1_threshold(labels: np.ndarray, probabilities: np.ndarray) -> float:
-    thresholds = np.arange(0.05, 0.951, 0.01)
-    scores = [f1_score(labels, probabilities >= t, zero_division=0) for t in thresholds]
-    return float(thresholds[int(np.argmax(scores))])
+    """Backward-compatible alias with deterministic accuracy tie-breaking."""
+    return select_operating_threshold(labels, probabilities, objective="f1")
 
 
-def classification_metrics(labels: np.ndarray, probabilities: np.ndarray,
-                           threshold: float) -> dict[str, float]:
-    pred = (probabilities >= threshold).astype(np.int64)
+def classification_metrics_from_predictions(
+        labels: np.ndarray, probabilities: np.ndarray,
+        pred: np.ndarray) -> dict[str, float]:
     tn, fp, fn, tp = confusion_matrix(labels, pred, labels=[0, 1]).ravel()
     return {
-        "threshold": threshold,
         "accuracy": accuracy_score(labels, pred),
         "balanced_accuracy": balanced_accuracy_score(labels, pred),
         "roc_auc": roc_auc_score(labels, probabilities),
         "pr_auc": average_precision_score(labels, probabilities),
+        "precision": precision_score(labels, pred, pos_label=1, zero_division=0),
         "sensitivity": recall_score(labels, pred, pos_label=1, zero_division=0),
         "specificity": tn / max(tn + fp, 1),
         "f1": f1_score(labels, pred, zero_division=0),
         "mcc": matthews_corrcoef(labels, pred),
         "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+    }
+
+
+def classification_metrics(labels: np.ndarray, probabilities: np.ndarray,
+                           threshold: float) -> dict[str, float]:
+    pred = (probabilities >= threshold).astype(np.int64)
+    return {
+        "threshold": threshold,
+        **classification_metrics_from_predictions(labels, probabilities, pred),
     }
 
 
@@ -325,7 +401,9 @@ def fit_inner_split(model: VascMambaHybrid, bmode: torch.Tensor,
         bmode, ulm, density, valid, labels, val_idx,
         config.batch_size, shuffle=False,
     )
-    weights = class_weights(labels[train_idx], device)
+    weights = class_weights(
+        labels[train_idx], device, power=config.class_weight_power
+    )
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler = CosineAnnealingLR(
         optimizer, T_max=max(1, config.epochs * len(train_loader)), eta_min=1e-6
@@ -370,7 +448,11 @@ def fit_inner_split(model: VascMambaHybrid, bmode: torch.Tensor,
 
     model.load_state_dict(best_state)
     val_prob, val_labels = predict(model, val_loader, device)
-    threshold = select_f1_threshold(val_labels, val_prob)
+    threshold = select_operating_threshold(
+        val_labels, val_prob,
+        objective=config.threshold_objective,
+        recall_floor=config.recall_floor,
+    )
     diagnostics = {
         "best_epoch": best_epoch,
         "best_val_loss": best_loss,
@@ -379,11 +461,111 @@ def fit_inner_split(model: VascMambaHybrid, bmode: torch.Tensor,
     return model, threshold, diagnostics
 
 
+def fit_fixed_epochs(model: VascMambaHybrid, bmode: torch.Tensor,
+                     ulm: torch.Tensor, density: torch.Tensor,
+                     valid: torch.Tensor, labels: torch.Tensor,
+                     train_idx: np.ndarray, epochs: int, config: TrainConfig,
+                     device: torch.device) -> VascMambaHybrid:
+    """Refit on the complete outer-training fold after model selection."""
+    if epochs < 1:
+        raise ValueError("epochs must be positive")
+    loader = make_loader(
+        bmode, ulm, density, valid, labels, train_idx,
+        config.batch_size, shuffle=True,
+    )
+    weights = class_weights(
+        labels[train_idx], device, power=config.class_weight_power
+    )
+    optimizer = AdamW(model.parameters(), lr=config.lr,
+                      weight_decay=config.weight_decay)
+    # Match the inner-training learning-rate trajectory.  Using ``epochs`` as
+    # T_max here would decay to eta_min much earlier than the model-selection
+    # runs and make the selected epoch non-transferable.
+    scheduler = CosineAnnealingLR(
+        optimizer, T_max=max(1, config.epochs * len(loader)), eta_min=1e-6
+    )
+    for _ in range(epochs):
+        model.train()
+        for b, u, d, mask, target in loader:
+            b, u, d = b.to(device), u.to(device), d.to(device)
+            mask, target = mask.to(device), target.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            loss = F.cross_entropy(
+                model(b, u, d, mask), target, weight=weights
+            )
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+            optimizer.step()
+            scheduler.step()
+    return model
+
+
+def select_with_inner_oof(bmode: torch.Tensor, ulm: torch.Tensor,
+                          density: torch.Tensor, valid: torch.Tensor,
+                          labels: torch.Tensor, outer_train: np.ndarray,
+                          config: TrainConfig, device: torch.device,
+                          seed: int) -> tuple[int, float, dict]:
+    """Estimate epochs and threshold using every outer-training patient once."""
+    if config.inner_folds < 2:
+        raise ValueError("inner_folds must be at least 2")
+    y_outer = labels[outer_train].numpy()
+    splitter = StratifiedKFold(
+        n_splits=config.inner_folds, shuffle=True, random_state=seed
+    )
+    inner_probability = np.full(len(outer_train), np.nan, dtype=np.float32)
+    best_epochs = []
+    for inner_fold, (rel_train, rel_val) in enumerate(
+        splitter.split(np.arange(len(outer_train)), y_outer), start=1
+    ):
+        inner_train = outer_train[rel_train]
+        inner_val = outer_train[rel_val]
+        seed_everything(seed + inner_fold)
+        model = VascMambaHybrid(
+            d_model=config.d_model,
+            d_state=config.d_state,
+            n_layers=config.n_layers,
+            n_views=bmode.shape[1],
+            order_by_density=config.order_by_density,
+        ).to(device)
+        model, _, diagnostics = fit_inner_split(
+            model, bmode, ulm, density, valid, labels,
+            inner_train, inner_val, config, device,
+        )
+        val_loader = make_loader(
+            bmode, ulm, density, valid, labels, inner_val,
+            config.batch_size, shuffle=False,
+        )
+        probability, target = predict(model, val_loader, device)
+        if not np.array_equal(target, y_outer[rel_val]):
+            raise RuntimeError("inner OOF labels are misaligned")
+        inner_probability[rel_val] = probability
+        best_epochs.append(int(diagnostics["best_epoch"]) + 1)
+
+    if np.isnan(inner_probability).any():
+        raise RuntimeError("inner cross-validation did not cover every patient")
+    selected_epochs = max(1, int(np.median(best_epochs)))
+    threshold = select_operating_threshold(
+        y_outer, inner_probability,
+        objective=config.threshold_objective,
+        recall_floor=config.recall_floor,
+    )
+    diagnostics = {
+        "inner_best_epochs": best_epochs,
+        "selected_epochs": selected_epochs,
+        "inner_oof_metrics": classification_metrics(
+            y_outer, inner_probability, threshold
+        ),
+    }
+    return selected_epochs, threshold, diagnostics
+
+
 def nested_cross_validate(bmode: torch.Tensor, ulm: torch.Tensor,
                           density: torch.Tensor, valid: torch.Tensor,
                           labels: torch.Tensor, config: TrainConfig,
                           output_dir: Path, device: torch.device,
                           seed: int = SEED) -> list[dict]:
+    if config.ensemble_size < 1:
+        raise ValueError("ensemble_size must be at least 1")
     output_dir.mkdir(parents=True, exist_ok=True)
     y_np = labels.numpy()
     outer = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
@@ -395,30 +577,40 @@ def nested_cross_validate(bmode: torch.Tensor, ulm: torch.Tensor,
     for fold, (outer_train, outer_test) in enumerate(
         outer.split(np.arange(len(labels)), y_np), start=1
     ):
-        inner_split = StratifiedShuffleSplit(
-            n_splits=1, test_size=0.2, random_state=seed + fold
-        )
-        rel_train, rel_val = next(inner_split.split(outer_train, y_np[outer_train]))
-        inner_train = outer_train[rel_train]
-        inner_val = outer_train[rel_val]
-
-        seed_everything(seed + fold)
-        model = VascMambaHybrid(
-            d_model=config.d_model,
-            d_state=config.d_state,
-            n_layers=config.n_layers,
-            n_views=bmode.shape[1],
-            order_by_density=config.order_by_density,
-        ).to(device)
-        model, threshold, diagnostics = fit_inner_split(
-            model, bmode, ulm, density, valid, labels,
-            inner_train, inner_val, config, device,
+        selected_epochs, threshold, diagnostics = select_with_inner_oof(
+            bmode, ulm, density, valid, labels, outer_train,
+            config, device, seed=seed + fold * 100,
         )
         test_loader = make_loader(
             bmode, ulm, density, valid, labels, outer_test,
             config.batch_size, shuffle=False,
         )
-        probability, target = predict(model, test_loader, device)
+        ensemble_probability = []
+        ensemble_states = []
+        target = None
+        for member in range(config.ensemble_size):
+            member_seed = seed + fold * 1000 + member
+            seed_everything(member_seed)
+            model = VascMambaHybrid(
+                d_model=config.d_model,
+                d_state=config.d_state,
+                n_layers=config.n_layers,
+                n_views=bmode.shape[1],
+                order_by_density=config.order_by_density,
+            ).to(device)
+            model = fit_fixed_epochs(
+                model, bmode, ulm, density, valid, labels,
+                outer_train, selected_epochs, config, device,
+            )
+            member_probability, member_target = predict(model, test_loader, device)
+            if target is None:
+                target = member_target
+            elif not np.array_equal(target, member_target):
+                raise RuntimeError("ensemble member labels are misaligned")
+            ensemble_probability.append(member_probability)
+            ensemble_states.append(copy.deepcopy(model.state_dict()))
+        probability = np.mean(ensemble_probability, axis=0)
+        assert target is not None
         oof_probability[outer_test] = probability
         oof_fold[outer_test] = fold
         oof_threshold[outer_test] = threshold
@@ -429,11 +621,11 @@ def nested_cross_validate(bmode: torch.Tensor, ulm: torch.Tensor,
         torch.save(
             {
                 "state_dict": model.state_dict(),
+                "ensemble_state_dicts": ensemble_states,
                 "threshold": threshold,
                 "config": asdict(config),
                 "fold": fold,
-                "inner_train_indices": inner_train,
-                "inner_val_indices": inner_val,
+                "outer_train_indices": outer_train,
                 "outer_test_indices": outer_test,
             },
             output_dir / f"fold_{fold}.pt",
@@ -441,7 +633,8 @@ def nested_cross_validate(bmode: torch.Tensor, ulm: torch.Tensor,
         print(
             f"fold={fold} acc={metrics['accuracy']:.4f} "
             f"bal_acc={metrics['balanced_accuracy']:.4f} "
-            f"auc={metrics['roc_auc']:.4f} f1={metrics['f1']:.4f} "
+            f"auc={metrics['roc_auc']:.4f} precision={metrics['precision']:.4f} "
+            f"recall={metrics['sensitivity']:.4f} f1={metrics['f1']:.4f} "
             f"threshold={threshold:.2f}"
         )
 
@@ -456,6 +649,33 @@ def nested_cross_validate(bmode: torch.Tensor, ulm: torch.Tensor,
         fold=oof_fold,
         threshold=oof_threshold,
     )
+    strict_pred = (oof_probability >= oof_threshold).astype(np.int64)
+    metric_keys = [
+        "accuracy", "balanced_accuracy", "roc_auc", "pr_auc", "precision",
+        "sensitivity", "specificity", "f1", "mcc",
+    ]
+    summary = {
+        "fold_mean": {
+            key: float(np.mean([result[key] for result in results]))
+            for key in metric_keys
+        },
+        "fold_sd": {
+            key: float(np.std([result[key] for result in results]))
+            for key in metric_keys
+        },
+        "pooled_strict": classification_metrics_from_predictions(
+            y_np, oof_probability, strict_pred
+        ),
+        "threshold_mean": float(oof_threshold.mean()),
+        "threshold_sd": float(oof_threshold.std()),
+        "majority_class_accuracy": float(np.max(np.bincount(y_np)) / len(y_np)),
+        "note": (
+            "pooled_strict uses only fold-specific thresholds selected from inner OOF; "
+            "the outer labels never select a threshold"
+        ),
+    }
+    with (output_dir / "nested_cv_summary.json").open("w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
     return results
 
 
@@ -531,7 +751,7 @@ def load_per_view_features(path: Path):
 
 def summarize(results: list[dict]) -> None:
     keys = [
-        "accuracy", "balanced_accuracy", "roc_auc", "pr_auc",
+        "accuracy", "balanced_accuracy", "roc_auc", "pr_auc", "precision",
         "sensitivity", "specificity", "f1", "mcc",
     ]
     print("\nNested outer-fold results (mean ± fold SD)")
@@ -551,6 +771,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--inner-folds", type=int, default=3)
+    parser.add_argument("--ensemble-size", type=int, default=3)
+    parser.add_argument(
+        "--class-weight-power", type=float, default=1.0,
+        help="0=unweighted CE, 1=fully balanced CE; intermediate values are ablations",
+    )
+    parser.add_argument(
+        "--threshold-objective",
+        choices=["clinical", "f1", "balanced_accuracy"], default="f1",
+    )
+    parser.add_argument(
+        "--recall-floor", type=float, default=0.90,
+        help="Minimum malignant recall used by the clinical threshold objective",
+    )
     parser.add_argument(
         "--order-by-density", action="store_true",
         help="Ablation only: sort paired B-mode/ULM views by ULM density",
@@ -568,6 +802,11 @@ def main() -> None:
         epochs=args.epochs,
         batch_size=args.batch_size,
         order_by_density=args.order_by_density,
+        inner_folds=args.inner_folds,
+        ensemble_size=args.ensemble_size,
+        class_weight_power=args.class_weight_power,
+        threshold_objective=args.threshold_objective,
+        recall_floor=args.recall_floor,
     )
     print(
         f"samples={len(labels)} views={bmode.shape[1]} feature_dim={bmode.shape[2]} "

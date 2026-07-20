@@ -24,9 +24,16 @@ BiomedCLIP **真实逐视图特征** + 轻量 selective SSM 分类头。
 
 训练采用nested 5-fold cross-validation：
 
-- 内层验证集：early stopping和分类阈值选择；
+- 内层3-fold OOF：每名外层训练患者恰好参与一次epoch/分类阈值选择；
+- 根据内层fold的最佳epoch取中位数，再用**完整外层训练集**重训，不再丢掉
+  20%的外层训练样本；
+- 每个外层fold默认训练3个不同随机种子的模型并平均概率，降低小样本方差；
 - 外层测试折：只评价一次，不参与模型或阈值选择；
-- 类别权重：仅根据当前内层训练集动态计算；
+- 类别权重：仅根据当前训练集动态计算；主结果保留与旧实验相同的完全平衡
+  权重，`--class-weight-power 0.5`仅作为预先声明的软化权重消融；
+- 默认在内层OOF上选择F1最优阈值，并以Accuracy、Precision和Recall依次打破
+  F1并列；如有预先定义的临床敏感度要求，可使用`--threshold-objective clinical
+  --recall-floor 0.90`；
 - 每折保存模型、阈值、划分索引和完整配置；
 - 保存每名患者恰好一次的外层OOF概率，便于paired bootstrap和统计检验；
 - 报告Accuracy、Balanced Accuracy、ROC-AUC、PR-AUC、Sensitivity、
@@ -62,6 +69,13 @@ python hybrid.py \
   --features /root/medic_data/biomedclip_perview_features.npz \
   --output-dir hybrid_nested_outputs
 
+# 可选：预先规定恶性Recall至少0.90，再在可行阈值中最大化Accuracy
+python hybrid.py \
+  --features /root/medic_data/biomedclip_perview_features.npz \
+  --output-dir hybrid_clinical_outputs \
+  --threshold-objective clinical \
+  --recall-floor 0.90
+
 # 3. 可选的density排序消融；必须与默认流程独立比较
 python hybrid.py \
   --features /root/medic_data/biomedclip_perview_features.npz \
@@ -90,7 +104,9 @@ python hybrid.py \
 两个独立内容向量；平均density也被复制4次，因此所谓vessel-guided ordering对
 该输入没有实际影响。当前入口不会再运行这条流程。
 
-241例（历史数据为60良性/181恶性）的折间标准差较大。方法间小幅差异需要使用
+241例（历史数据为60良性/181恶性）的折间标准差较大。仅预测恶性即可得到
+181/241=0.7510的Accuracy，因此Accuracy必须与Precision、Recall、Specificity、
+F1和AUC联合解释。方法间小幅差异需要使用
 相同外层OOF样本做paired bootstrap/统计检验，并最终在锁定阈值的外部医院数据
 上验证。
 
