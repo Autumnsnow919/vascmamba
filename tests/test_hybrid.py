@@ -4,6 +4,7 @@ import torch
 
 from hybrid import (
     SelectiveSSM,
+    VascMambaFusionV2,
     VascMambaHybrid,
     class_weights,
     classification_metrics,
@@ -50,6 +51,30 @@ def test_all_ssm_parameters_receive_gradients():
     missing = [name for name, parameter in layer.named_parameters()
                if parameter.grad is None]
     assert missing == []
+
+
+def test_fusion_v2_is_invariant_to_paired_input_permutation_when_sorted():
+    torch.manual_seed(1)
+    model = VascMambaFusionV2(
+        d_model=16, n_layers=1, order_by_density=True, view_dropout=0.0
+    ).eval()
+    bmode = torch.randn(2, 4, 512)
+    ulm = torch.randn(2, 4, 512)
+    density = torch.tensor([[0.1, 0.4, 0.2, 0.3], [0.8, 0.2, 0.5, 0.1]])
+    valid = torch.ones(2, 4, dtype=torch.bool)
+    permutation = torch.tensor([[2, 0, 3, 1], [1, 3, 0, 2]])
+    feature_permutation = permutation.unsqueeze(-1).expand_as(bmode)
+
+    with torch.no_grad():
+        expected = model(bmode, ulm, density, valid)
+        actual = model(
+            bmode.gather(1, feature_permutation),
+            ulm.gather(1, feature_permutation),
+            density.gather(1, permutation),
+            valid.gather(1, permutation),
+        )
+
+    torch.testing.assert_close(actual, expected)
 
 
 def test_rejects_expanded_session_means(tmp_path):

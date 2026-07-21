@@ -227,6 +227,155 @@ class VascMambaHybrid(nn.Module):
         return self.head(pooled)
 
 
+class VascMambaFusionV2(nn.Module):
+    """Small-sample dual-path fusion of global and per-view evidence.
+
+    The global path preserves the strong patient-level BiomedCLIP mean used by
+    the historical baseline.  The view path creates one paired token per
+    acquisition from B-mode, ULM, their absolute difference, their interaction
+    and ULM density.  A weight-shared bidirectional Mamba encoder avoids making
+    the arbitrary scan direction itself predictive.  Both paths are retained
+    in the final classifier, with a direct linear skip from the original 512-D
+    embeddings so the sequence model cannot erase linearly separable evidence.
+    """
+
+    def __init__(self, bc_dim: int = 512, d_model: int = 32,
+                 d_state: int = 4, n_layers: int = 1, n_views: int = 4,
+                 order_by_density: bool = True, view_dropout: float = 0.10):
+        super().__init__()
+        if not 0.0 <= view_dropout < 1.0:
+            raise ValueError("view_dropout must be in [0, 1)")
+        self.n_views = n_views
+        self.order_by_density = order_by_density
+        self.view_dropout = view_dropout
+
+        self.bmode_proj = nn.Sequential(
+            nn.Linear(bc_dim, d_model), nn.LayerNorm(d_model), nn.GELU()
+        )
+        self.ulm_proj = nn.Sequential(
+            nn.Linear(bc_dim, d_model), nn.LayerNorm(d_model), nn.GELU()
+        )
+        self.pair_fuse = nn.Sequential(
+            nn.Linear(4 * d_model + 1, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
+        self.pos_emb = nn.Parameter(torch.randn(1, n_views, d_model) * 0.02)
+        self.mamba = nn.ModuleList(
+            [MambaBlock(d_model, d_state, d_conv=2, expand=2)
+             for _ in range(n_layers)]
+        )
+        self.token_norm = nn.LayerNorm(d_model)
+        self.attention = nn.Sequential(
+            nn.LayerNorm(d_model), nn.Linear(d_model, d_model),
+            nn.Tanh(), nn.Linear(d_model, 1),
+        )
+        fused_dim = 4 * d_model + 3
+        self.head = nn.Sequential(
+            nn.LayerNorm(fused_dim),
+            nn.Linear(fused_dim, 64),
+            nn.GELU(),
+            nn.Dropout(0.30),
+            nn.Linear(64, 2),
+        )
+        self.global_skip = nn.Linear(2 * bc_dim + 3, 2)
+
+    @staticmethod
+    def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        weight = mask.unsqueeze(-1).to(x.dtype)
+        return (x * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1.0)
+
+    @staticmethod
+    def _density_stats(density: torch.Tensor,
+                       mask: torch.Tensor) -> torch.Tensor:
+        weight = mask.to(density.dtype)
+        count = weight.sum(dim=1).clamp_min(1.0)
+        mean = (density * weight).sum(dim=1) / count
+        centered = (density - mean.unsqueeze(1)) * weight
+        std = torch.sqrt(centered.square().sum(dim=1) / count + 1e-8)
+        maximum = density.masked_fill(~mask, float("-inf")).amax(dim=1)
+        maximum = torch.where(mask.any(dim=1), maximum, torch.zeros_like(maximum))
+        return torch.stack((mean, maximum, std), dim=1)
+
+    def _drop_views(self, mask: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.view_dropout == 0.0:
+            return mask
+        keep = torch.rand(mask.shape, device=mask.device) >= self.view_dropout
+        candidate = mask & keep
+        # Never manufacture an all-missing patient during augmentation.
+        return torch.where(candidate.any(dim=1, keepdim=True), candidate, mask)
+
+    def forward(self, bmode_feats: torch.Tensor, ulm_feats: torch.Tensor,
+                ulm_density: torch.Tensor | None = None,
+                view_mask: torch.Tensor | None = None) -> torch.Tensor:
+        if bmode_feats.ndim != 3 or ulm_feats.shape != bmode_feats.shape:
+            raise ValueError("B-mode and ULM features must both have shape (B,V,D)")
+        batch, views, _ = bmode_feats.shape
+        if views != self.n_views:
+            raise ValueError(f"expected {self.n_views} views, got {views}")
+        if ulm_density is None:
+            ulm_density = bmode_feats.new_zeros(batch, views)
+        if ulm_density.shape != (batch, views):
+            raise ValueError("density must have shape (B,V)")
+        if view_mask is None:
+            view_mask = torch.ones(
+                batch, views, device=bmode_feats.device, dtype=torch.bool
+            )
+        if view_mask.shape != (batch, views):
+            raise ValueError("view_mask must have shape (B,V)")
+        if not view_mask.any(dim=1).all():
+            raise ValueError("each patient must contain at least one valid view")
+        view_mask = self._drop_views(view_mask.bool())
+
+        if self.order_by_density:
+            sortable_density = ulm_density.masked_fill(~view_mask, float("-inf"))
+            order = sortable_density.argsort(dim=1, descending=True)
+            feat_order = order.unsqueeze(-1).expand_as(bmode_feats)
+            bmode_feats = bmode_feats.gather(1, feat_order)
+            ulm_feats = ulm_feats.gather(1, feat_order)
+            ulm_density = ulm_density.gather(1, order)
+            view_mask = view_mask.gather(1, order)
+
+        b_token = self.bmode_proj(bmode_feats)
+        u_token = self.ulm_proj(ulm_feats)
+        paired = torch.cat(
+            (b_token, u_token, (b_token - u_token).abs(),
+             b_token * u_token, ulm_density.unsqueeze(-1)),
+            dim=-1,
+        )
+        tokens = self.pair_fuse(paired) + self.pos_emb
+        tokens = tokens * view_mask.unsqueeze(-1).to(tokens.dtype)
+
+        forward = tokens
+        reverse = tokens.flip(1)
+        for layer in self.mamba:
+            forward = layer(forward)
+            reverse = layer(reverse)
+            forward = forward * view_mask.unsqueeze(-1).to(forward.dtype)
+            reverse_mask = view_mask.flip(1).unsqueeze(-1).to(reverse.dtype)
+            reverse = reverse * reverse_mask
+        tokens = self.token_norm(0.5 * (forward + reverse.flip(1)))
+
+        attention_logits = self.attention(tokens).squeeze(-1)
+        attention_logits = attention_logits.masked_fill(~view_mask, float("-inf"))
+        attention_weight = torch.softmax(attention_logits, dim=1).unsqueeze(-1)
+        attended = (tokens * attention_weight).sum(dim=1)
+        sequence_mean = self._masked_mean(tokens, view_mask)
+        b_global = self._masked_mean(b_token, view_mask)
+        u_global = self._masked_mean(u_token, view_mask)
+        density_stats = self._density_stats(ulm_density, view_mask)
+
+        fused = torch.cat(
+            (attended, sequence_mean, b_global, u_global, density_stats), dim=1
+        )
+        raw_global = torch.cat(
+            (self._masked_mean(bmode_feats, view_mask),
+             self._masked_mean(ulm_feats, view_mask), density_stats),
+            dim=1,
+        )
+        return self.head(fused) + self.global_skip(raw_global)
+
+
 class FeatDataset(Dataset):
     def __init__(self, bmode: torch.Tensor, ulm: torch.Tensor,
                  density: torch.Tensor, labels: torch.Tensor,
@@ -249,10 +398,12 @@ class FeatDataset(Dataset):
 
 @dataclass
 class TrainConfig:
+    architecture: str = "fusion_v2"
     d_model: int = 32
     d_state: int = 4
     n_layers: int = 1
-    order_by_density: bool = False
+    order_by_density: bool = True
+    view_dropout: float = 0.10
     epochs: int = 100
     batch_size: int = 32
     lr: float = 5e-4
@@ -263,6 +414,25 @@ class TrainConfig:
     class_weight_power: float = 1.0
     threshold_objective: str = "f1"
     recall_floor: float = 0.90
+
+
+def build_model(config: TrainConfig, bc_dim: int,
+                n_views: int) -> nn.Module:
+    common = dict(
+        bc_dim=bc_dim,
+        d_model=config.d_model,
+        d_state=config.d_state,
+        n_layers=config.n_layers,
+        n_views=n_views,
+        order_by_density=config.order_by_density,
+    )
+    if config.architecture == "fusion_v2":
+        return VascMambaFusionV2(
+            **common, view_dropout=config.view_dropout
+        )
+    if config.architecture == "mamba_v1":
+        return VascMambaHybrid(**common)
+    raise ValueError(f"unknown architecture: {config.architecture}")
 
 
 def class_weights(labels: torch.Tensor, device: torch.device,
@@ -388,11 +558,11 @@ def classification_metrics(labels: np.ndarray, probabilities: np.ndarray,
     }
 
 
-def fit_inner_split(model: VascMambaHybrid, bmode: torch.Tensor,
+def fit_inner_split(model: nn.Module, bmode: torch.Tensor,
                     ulm: torch.Tensor, density: torch.Tensor, valid: torch.Tensor,
                     labels: torch.Tensor, train_idx: np.ndarray,
                     val_idx: np.ndarray, config: TrainConfig,
-                    device: torch.device) -> tuple[VascMambaHybrid, float, dict]:
+                    device: torch.device) -> tuple[nn.Module, float, dict]:
     train_loader = make_loader(
         bmode, ulm, density, valid, labels, train_idx,
         config.batch_size, shuffle=True,
@@ -461,11 +631,11 @@ def fit_inner_split(model: VascMambaHybrid, bmode: torch.Tensor,
     return model, threshold, diagnostics
 
 
-def fit_fixed_epochs(model: VascMambaHybrid, bmode: torch.Tensor,
+def fit_fixed_epochs(model: nn.Module, bmode: torch.Tensor,
                      ulm: torch.Tensor, density: torch.Tensor,
                      valid: torch.Tensor, labels: torch.Tensor,
                      train_idx: np.ndarray, epochs: int, config: TrainConfig,
-                     device: torch.device) -> VascMambaHybrid:
+                     device: torch.device) -> nn.Module:
     """Refit on the complete outer-training fold after model selection."""
     if epochs < 1:
         raise ValueError("epochs must be positive")
@@ -520,12 +690,8 @@ def select_with_inner_oof(bmode: torch.Tensor, ulm: torch.Tensor,
         inner_train = outer_train[rel_train]
         inner_val = outer_train[rel_val]
         seed_everything(seed + inner_fold)
-        model = VascMambaHybrid(
-            d_model=config.d_model,
-            d_state=config.d_state,
-            n_layers=config.n_layers,
-            n_views=bmode.shape[1],
-            order_by_density=config.order_by_density,
+        model = build_model(
+            config, bc_dim=bmode.shape[2], n_views=bmode.shape[1]
         ).to(device)
         model, _, diagnostics = fit_inner_split(
             model, bmode, ulm, density, valid, labels,
@@ -591,12 +757,8 @@ def nested_cross_validate(bmode: torch.Tensor, ulm: torch.Tensor,
         for member in range(config.ensemble_size):
             member_seed = seed + fold * 1000 + member
             seed_everything(member_seed)
-            model = VascMambaHybrid(
-                d_model=config.d_model,
-                d_state=config.d_state,
-                n_layers=config.n_layers,
-                n_views=bmode.shape[1],
-                order_by_density=config.order_by_density,
+            model = build_model(
+                config, bc_dim=bmode.shape[2], n_views=bmode.shape[1]
             ).to(device)
             model = fit_fixed_epochs(
                 model, bmode, ulm, density, valid, labels,
@@ -687,6 +849,8 @@ def train_hybrid(model, X_bmode, X_ulm, X_density, y, idx_train, idx_val,
     not be used to claim an unbiased test result.  New experiments should call
     :func:`nested_cross_validate`.
     """
+    if not isinstance(model, VascMambaHybrid):
+        raise TypeError("train_hybrid is a legacy VascMambaHybrid-only wrapper")
     valid = torch.ones_like(X_density, dtype=torch.bool) if X_valid is None else X_valid
     config = TrainConfig(
         d_model=model.head[1].in_features,
@@ -771,6 +935,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument(
+        "--architecture", choices=["fusion_v2", "mamba_v1"], default="fusion_v2",
+    )
+    parser.add_argument("--view-dropout", type=float, default=0.10)
     parser.add_argument("--inner-folds", type=int, default=3)
     parser.add_argument("--ensemble-size", type=int, default=3)
     parser.add_argument(
@@ -785,10 +953,16 @@ def parse_args() -> argparse.Namespace:
         "--recall-floor", type=float, default=0.90,
         help="Minimum malignant recall used by the clinical threshold objective",
     )
-    parser.add_argument(
-        "--order-by-density", action="store_true",
-        help="Ablation only: sort paired B-mode/ULM views by ULM density",
+    order_group = parser.add_mutually_exclusive_group()
+    order_group.add_argument(
+        "--order-by-density", dest="order_by_density", action="store_true",
+        help="Sort paired B-mode/ULM views by ULM density",
     )
+    order_group.add_argument(
+        "--preserve-view-order", dest="order_by_density", action="store_false",
+        help="Keep the dataset view order",
+    )
+    parser.set_defaults(order_by_density=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -798,10 +972,16 @@ def main() -> None:
     seed_everything(args.seed)
     device = torch.device(args.device)
     bmode, ulm, density, valid, labels = load_per_view_features(args.features)
+    order_by_density = (
+        args.architecture == "fusion_v2"
+        if args.order_by_density is None else args.order_by_density
+    )
     config = TrainConfig(
+        architecture=args.architecture,
         epochs=args.epochs,
         batch_size=args.batch_size,
-        order_by_density=args.order_by_density,
+        order_by_density=order_by_density,
+        view_dropout=args.view_dropout,
         inner_folds=args.inner_folds,
         ensemble_size=args.ensemble_size,
         class_weight_power=args.class_weight_power,
@@ -810,7 +990,9 @@ def main() -> None:
     )
     print(
         f"samples={len(labels)} views={bmode.shape[1]} feature_dim={bmode.shape[2]} "
-        f"valid_views={int(valid.sum())}/{valid.numel()} device={device}"
+        f"valid_views={int(valid.sum())}/{valid.numel()} device={device} "
+        f"architecture={config.architecture} density_order={config.order_by_density} "
+        f"ensemble={config.ensemble_size}"
     )
     results = nested_cross_validate(
         bmode, ulm, density, valid, labels, config,
