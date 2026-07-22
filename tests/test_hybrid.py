@@ -2,7 +2,15 @@ import numpy as np
 import pytest
 import torch
 
-from hybrid import SelectiveSSM, VascMambaHybrid, load_per_view_features
+from hybrid import (
+    SelectiveSSM,
+    VascMambaFusionV2,
+    VascMambaHybrid,
+    class_weights,
+    classification_metrics,
+    load_per_view_features,
+    select_operating_threshold,
+)
 
 
 def test_density_ordering_preserves_modality_pairs():
@@ -45,6 +53,30 @@ def test_all_ssm_parameters_receive_gradients():
     assert missing == []
 
 
+def test_fusion_v2_is_invariant_to_paired_input_permutation_when_sorted():
+    torch.manual_seed(1)
+    model = VascMambaFusionV2(
+        d_model=16, n_layers=1, order_by_density=True, view_dropout=0.0
+    ).eval()
+    bmode = torch.randn(2, 4, 512)
+    ulm = torch.randn(2, 4, 512)
+    density = torch.tensor([[0.1, 0.4, 0.2, 0.3], [0.8, 0.2, 0.5, 0.1]])
+    valid = torch.ones(2, 4, dtype=torch.bool)
+    permutation = torch.tensor([[2, 0, 3, 1], [1, 3, 0, 2]])
+    feature_permutation = permutation.unsqueeze(-1).expand_as(bmode)
+
+    with torch.no_grad():
+        expected = model(bmode, ulm, density, valid)
+        actual = model(
+            bmode.gather(1, feature_permutation),
+            ulm.gather(1, feature_permutation),
+            density.gather(1, permutation),
+            valid.gather(1, permutation),
+        )
+
+    torch.testing.assert_close(actual, expected)
+
+
 def test_rejects_expanded_session_means(tmp_path):
     rng = np.random.default_rng(0)
     bmode = np.repeat(rng.normal(size=(12, 1, 512)), 4, axis=1).astype("float32")
@@ -56,3 +88,28 @@ def test_rejects_expanded_session_means(tmp_path):
 
     with pytest.raises(ValueError, match="expanded session means"):
         load_per_view_features(path)
+
+
+def test_clinical_threshold_honours_recall_floor_then_accuracy():
+    labels = np.asarray([0, 0, 1, 1, 1, 1])
+    probabilities = np.asarray([0.10, 0.55, 0.45, 0.60, 0.70, 0.80])
+
+    threshold = select_operating_threshold(
+        labels, probabilities, objective="clinical", recall_floor=0.75
+    )
+    metrics = classification_metrics(labels, probabilities, threshold)
+
+    assert metrics["sensitivity"] >= 0.75
+    assert metrics["accuracy"] == pytest.approx(5 / 6)
+    assert metrics["precision"] == pytest.approx(1.0)
+
+
+def test_class_weight_power_softens_inverse_frequency_weights():
+    labels = torch.tensor([0, 1, 1, 1])
+    balanced = class_weights(labels, torch.device("cpu"), power=1.0)
+    softened = class_weights(labels, torch.device("cpu"), power=0.5)
+    unweighted = class_weights(labels, torch.device("cpu"), power=0.0)
+
+    assert (balanced[0] / balanced[1]).item() == pytest.approx(3.0)
+    assert (softened[0] / softened[1]).item() == pytest.approx(3.0 ** 0.5)
+    assert torch.allclose(unweighted, torch.ones(2))

@@ -28,10 +28,11 @@ from sklearn.metrics import (
     confusion_matrix,
     f1_score,
     matthews_corrcoef,
+    precision_score,
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
+from sklearn.model_selection import StratifiedKFold
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
@@ -226,6 +227,155 @@ class VascMambaHybrid(nn.Module):
         return self.head(pooled)
 
 
+class VascMambaFusionV2(nn.Module):
+    """Small-sample dual-path fusion of global and per-view evidence.
+
+    The global path preserves the strong patient-level BiomedCLIP mean used by
+    the historical baseline.  The view path creates one paired token per
+    acquisition from B-mode, ULM, their absolute difference, their interaction
+    and ULM density.  A weight-shared bidirectional Mamba encoder avoids making
+    the arbitrary scan direction itself predictive.  Both paths are retained
+    in the final classifier, with a direct linear skip from the original 512-D
+    embeddings so the sequence model cannot erase linearly separable evidence.
+    """
+
+    def __init__(self, bc_dim: int = 512, d_model: int = 32,
+                 d_state: int = 4, n_layers: int = 1, n_views: int = 4,
+                 order_by_density: bool = True, view_dropout: float = 0.10):
+        super().__init__()
+        if not 0.0 <= view_dropout < 1.0:
+            raise ValueError("view_dropout must be in [0, 1)")
+        self.n_views = n_views
+        self.order_by_density = order_by_density
+        self.view_dropout = view_dropout
+
+        self.bmode_proj = nn.Sequential(
+            nn.Linear(bc_dim, d_model), nn.LayerNorm(d_model), nn.GELU()
+        )
+        self.ulm_proj = nn.Sequential(
+            nn.Linear(bc_dim, d_model), nn.LayerNorm(d_model), nn.GELU()
+        )
+        self.pair_fuse = nn.Sequential(
+            nn.Linear(4 * d_model + 1, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
+        self.pos_emb = nn.Parameter(torch.randn(1, n_views, d_model) * 0.02)
+        self.mamba = nn.ModuleList(
+            [MambaBlock(d_model, d_state, d_conv=2, expand=2)
+             for _ in range(n_layers)]
+        )
+        self.token_norm = nn.LayerNorm(d_model)
+        self.attention = nn.Sequential(
+            nn.LayerNorm(d_model), nn.Linear(d_model, d_model),
+            nn.Tanh(), nn.Linear(d_model, 1),
+        )
+        fused_dim = 4 * d_model + 3
+        self.head = nn.Sequential(
+            nn.LayerNorm(fused_dim),
+            nn.Linear(fused_dim, 64),
+            nn.GELU(),
+            nn.Dropout(0.30),
+            nn.Linear(64, 2),
+        )
+        self.global_skip = nn.Linear(2 * bc_dim + 3, 2)
+
+    @staticmethod
+    def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        weight = mask.unsqueeze(-1).to(x.dtype)
+        return (x * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1.0)
+
+    @staticmethod
+    def _density_stats(density: torch.Tensor,
+                       mask: torch.Tensor) -> torch.Tensor:
+        weight = mask.to(density.dtype)
+        count = weight.sum(dim=1).clamp_min(1.0)
+        mean = (density * weight).sum(dim=1) / count
+        centered = (density - mean.unsqueeze(1)) * weight
+        std = torch.sqrt(centered.square().sum(dim=1) / count + 1e-8)
+        maximum = density.masked_fill(~mask, float("-inf")).amax(dim=1)
+        maximum = torch.where(mask.any(dim=1), maximum, torch.zeros_like(maximum))
+        return torch.stack((mean, maximum, std), dim=1)
+
+    def _drop_views(self, mask: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.view_dropout == 0.0:
+            return mask
+        keep = torch.rand(mask.shape, device=mask.device) >= self.view_dropout
+        candidate = mask & keep
+        # Never manufacture an all-missing patient during augmentation.
+        return torch.where(candidate.any(dim=1, keepdim=True), candidate, mask)
+
+    def forward(self, bmode_feats: torch.Tensor, ulm_feats: torch.Tensor,
+                ulm_density: torch.Tensor | None = None,
+                view_mask: torch.Tensor | None = None) -> torch.Tensor:
+        if bmode_feats.ndim != 3 or ulm_feats.shape != bmode_feats.shape:
+            raise ValueError("B-mode and ULM features must both have shape (B,V,D)")
+        batch, views, _ = bmode_feats.shape
+        if views != self.n_views:
+            raise ValueError(f"expected {self.n_views} views, got {views}")
+        if ulm_density is None:
+            ulm_density = bmode_feats.new_zeros(batch, views)
+        if ulm_density.shape != (batch, views):
+            raise ValueError("density must have shape (B,V)")
+        if view_mask is None:
+            view_mask = torch.ones(
+                batch, views, device=bmode_feats.device, dtype=torch.bool
+            )
+        if view_mask.shape != (batch, views):
+            raise ValueError("view_mask must have shape (B,V)")
+        if not view_mask.any(dim=1).all():
+            raise ValueError("each patient must contain at least one valid view")
+        view_mask = self._drop_views(view_mask.bool())
+
+        if self.order_by_density:
+            sortable_density = ulm_density.masked_fill(~view_mask, float("-inf"))
+            order = sortable_density.argsort(dim=1, descending=True)
+            feat_order = order.unsqueeze(-1).expand_as(bmode_feats)
+            bmode_feats = bmode_feats.gather(1, feat_order)
+            ulm_feats = ulm_feats.gather(1, feat_order)
+            ulm_density = ulm_density.gather(1, order)
+            view_mask = view_mask.gather(1, order)
+
+        b_token = self.bmode_proj(bmode_feats)
+        u_token = self.ulm_proj(ulm_feats)
+        paired = torch.cat(
+            (b_token, u_token, (b_token - u_token).abs(),
+             b_token * u_token, ulm_density.unsqueeze(-1)),
+            dim=-1,
+        )
+        tokens = self.pair_fuse(paired) + self.pos_emb
+        tokens = tokens * view_mask.unsqueeze(-1).to(tokens.dtype)
+
+        forward = tokens
+        reverse = tokens.flip(1)
+        for layer in self.mamba:
+            forward = layer(forward)
+            reverse = layer(reverse)
+            forward = forward * view_mask.unsqueeze(-1).to(forward.dtype)
+            reverse_mask = view_mask.flip(1).unsqueeze(-1).to(reverse.dtype)
+            reverse = reverse * reverse_mask
+        tokens = self.token_norm(0.5 * (forward + reverse.flip(1)))
+
+        attention_logits = self.attention(tokens).squeeze(-1)
+        attention_logits = attention_logits.masked_fill(~view_mask, float("-inf"))
+        attention_weight = torch.softmax(attention_logits, dim=1).unsqueeze(-1)
+        attended = (tokens * attention_weight).sum(dim=1)
+        sequence_mean = self._masked_mean(tokens, view_mask)
+        b_global = self._masked_mean(b_token, view_mask)
+        u_global = self._masked_mean(u_token, view_mask)
+        density_stats = self._density_stats(ulm_density, view_mask)
+
+        fused = torch.cat(
+            (attended, sequence_mean, b_global, u_global, density_stats), dim=1
+        )
+        raw_global = torch.cat(
+            (self._masked_mean(bmode_feats, view_mask),
+             self._masked_mean(ulm_feats, view_mask), density_stats),
+            dim=1,
+        )
+        return self.head(fused) + self.global_skip(raw_global)
+
+
 class FeatDataset(Dataset):
     def __init__(self, bmode: torch.Tensor, ulm: torch.Tensor,
                  density: torch.Tensor, labels: torch.Tensor,
@@ -248,22 +398,58 @@ class FeatDataset(Dataset):
 
 @dataclass
 class TrainConfig:
+    architecture: str = "fusion_v2"
     d_model: int = 32
     d_state: int = 4
     n_layers: int = 1
-    order_by_density: bool = False
+    order_by_density: bool = True
+    view_dropout: float = 0.10
     epochs: int = 100
     batch_size: int = 32
     lr: float = 5e-4
     weight_decay: float = 5e-3
     patience: int = 20
+    inner_folds: int = 3
+    ensemble_size: int = 3
+    class_weight_power: float = 1.0
+    threshold_objective: str = "f1"
+    recall_floor: float = 0.90
 
 
-def class_weights(labels: torch.Tensor, device: torch.device) -> torch.Tensor:
+def build_model(config: TrainConfig, bc_dim: int,
+                n_views: int) -> nn.Module:
+    common = dict(
+        bc_dim=bc_dim,
+        d_model=config.d_model,
+        d_state=config.d_state,
+        n_layers=config.n_layers,
+        n_views=n_views,
+        order_by_density=config.order_by_density,
+    )
+    if config.architecture == "fusion_v2":
+        return VascMambaFusionV2(
+            **common, view_dropout=config.view_dropout
+        )
+    if config.architecture == "mamba_v1":
+        return VascMambaHybrid(**common)
+    raise ValueError(f"unknown architecture: {config.architecture}")
+
+
+def class_weights(labels: torch.Tensor, device: torch.device,
+                  power: float = 1.0) -> torch.Tensor:
+    """Return softened inverse-frequency weights.
+
+    ``power=1`` exactly balances both classes, while ``power=0`` is ordinary
+    cross-entropy.  Intermediate values are available as an explicit ablation;
+    the default remains fully balanced for comparability with prior runs.
+    """
+    if not 0.0 <= power <= 1.0:
+        raise ValueError("class_weight_power must be in [0, 1]")
     counts = torch.bincount(labels.long(), minlength=2).float()
     if (counts == 0).any():
         raise ValueError("both classes are required in each training split")
-    return (counts.sum() / (2.0 * counts)).to(device)
+    balanced = counts.sum() / (2.0 * counts)
+    return balanced.pow(power).to(device)
 
 
 def make_loader(bmode: torch.Tensor, ulm: torch.Tensor, density: torch.Tensor,
@@ -288,22 +474,73 @@ def predict(model: nn.Module, loader: DataLoader, device: torch.device):
     return torch.cat(probabilities).numpy(), torch.cat(labels).numpy()
 
 
+def _threshold_candidates(probabilities: np.ndarray) -> np.ndarray:
+    """All decision boundaries that can change a prediction, plus 0.5."""
+    unique = np.unique(np.asarray(probabilities, dtype=float))
+    if len(unique) < 2:
+        return np.asarray([0.5], dtype=float)
+    midpoints = (unique[:-1] + unique[1:]) / 2.0
+    return np.unique(np.clip(np.r_[0.0, midpoints, 0.5, 1.0], 0.0, 1.0))
+
+
+def select_operating_threshold(labels: np.ndarray, probabilities: np.ndarray,
+                               objective: str = "clinical",
+                               recall_floor: float = 0.90) -> float:
+    """Select a threshold only from inner out-of-fold predictions.
+
+    ``clinical`` maximizes accuracy while requiring malignant sensitivity to
+    remain above ``recall_floor``.  Precision and F1 break ties.  This avoids
+    the previous behaviour where a tiny, single validation split could choose
+    a threshold below the all-malignant operating point.  Alternative
+    objectives are exposed for preregistered ablations.
+    """
+    if objective not in {"clinical", "f1", "balanced_accuracy"}:
+        raise ValueError(f"unknown threshold objective: {objective}")
+    if not 0.0 <= recall_floor <= 1.0:
+        raise ValueError("recall_floor must be in [0, 1]")
+
+    rows = []
+    for threshold in _threshold_candidates(probabilities):
+        metrics = classification_metrics(labels, probabilities, float(threshold))
+        rows.append(metrics)
+
+    if objective == "clinical":
+        feasible = [row for row in rows if row["sensitivity"] >= recall_floor]
+        pool = feasible or rows
+        key = lambda row: (
+            row["accuracy"], row["precision"], row["f1"],
+            row["sensitivity"], -abs(row["threshold"] - 0.5),
+        )
+    elif objective == "f1":
+        pool = rows
+        key = lambda row: (
+            row["f1"], row["accuracy"], row["precision"],
+            row["sensitivity"], -abs(row["threshold"] - 0.5),
+        )
+    else:
+        pool = rows
+        key = lambda row: (
+            row["balanced_accuracy"], row["f1"], row["accuracy"],
+            -abs(row["threshold"] - 0.5),
+        )
+    return float(max(pool, key=key)["threshold"])
+
+
 def select_f1_threshold(labels: np.ndarray, probabilities: np.ndarray) -> float:
-    thresholds = np.arange(0.05, 0.951, 0.01)
-    scores = [f1_score(labels, probabilities >= t, zero_division=0) for t in thresholds]
-    return float(thresholds[int(np.argmax(scores))])
+    """Backward-compatible alias with deterministic accuracy tie-breaking."""
+    return select_operating_threshold(labels, probabilities, objective="f1")
 
 
-def classification_metrics(labels: np.ndarray, probabilities: np.ndarray,
-                           threshold: float) -> dict[str, float]:
-    pred = (probabilities >= threshold).astype(np.int64)
+def classification_metrics_from_predictions(
+        labels: np.ndarray, probabilities: np.ndarray,
+        pred: np.ndarray) -> dict[str, float]:
     tn, fp, fn, tp = confusion_matrix(labels, pred, labels=[0, 1]).ravel()
     return {
-        "threshold": threshold,
         "accuracy": accuracy_score(labels, pred),
         "balanced_accuracy": balanced_accuracy_score(labels, pred),
         "roc_auc": roc_auc_score(labels, probabilities),
         "pr_auc": average_precision_score(labels, probabilities),
+        "precision": precision_score(labels, pred, pos_label=1, zero_division=0),
         "sensitivity": recall_score(labels, pred, pos_label=1, zero_division=0),
         "specificity": tn / max(tn + fp, 1),
         "f1": f1_score(labels, pred, zero_division=0),
@@ -312,11 +549,20 @@ def classification_metrics(labels: np.ndarray, probabilities: np.ndarray,
     }
 
 
-def fit_inner_split(model: VascMambaHybrid, bmode: torch.Tensor,
+def classification_metrics(labels: np.ndarray, probabilities: np.ndarray,
+                           threshold: float) -> dict[str, float]:
+    pred = (probabilities >= threshold).astype(np.int64)
+    return {
+        "threshold": threshold,
+        **classification_metrics_from_predictions(labels, probabilities, pred),
+    }
+
+
+def fit_inner_split(model: nn.Module, bmode: torch.Tensor,
                     ulm: torch.Tensor, density: torch.Tensor, valid: torch.Tensor,
                     labels: torch.Tensor, train_idx: np.ndarray,
                     val_idx: np.ndarray, config: TrainConfig,
-                    device: torch.device) -> tuple[VascMambaHybrid, float, dict]:
+                    device: torch.device) -> tuple[nn.Module, float, dict]:
     train_loader = make_loader(
         bmode, ulm, density, valid, labels, train_idx,
         config.batch_size, shuffle=True,
@@ -325,7 +571,9 @@ def fit_inner_split(model: VascMambaHybrid, bmode: torch.Tensor,
         bmode, ulm, density, valid, labels, val_idx,
         config.batch_size, shuffle=False,
     )
-    weights = class_weights(labels[train_idx], device)
+    weights = class_weights(
+        labels[train_idx], device, power=config.class_weight_power
+    )
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler = CosineAnnealingLR(
         optimizer, T_max=max(1, config.epochs * len(train_loader)), eta_min=1e-6
@@ -370,7 +618,11 @@ def fit_inner_split(model: VascMambaHybrid, bmode: torch.Tensor,
 
     model.load_state_dict(best_state)
     val_prob, val_labels = predict(model, val_loader, device)
-    threshold = select_f1_threshold(val_labels, val_prob)
+    threshold = select_operating_threshold(
+        val_labels, val_prob,
+        objective=config.threshold_objective,
+        recall_floor=config.recall_floor,
+    )
     diagnostics = {
         "best_epoch": best_epoch,
         "best_val_loss": best_loss,
@@ -379,11 +631,107 @@ def fit_inner_split(model: VascMambaHybrid, bmode: torch.Tensor,
     return model, threshold, diagnostics
 
 
+def fit_fixed_epochs(model: nn.Module, bmode: torch.Tensor,
+                     ulm: torch.Tensor, density: torch.Tensor,
+                     valid: torch.Tensor, labels: torch.Tensor,
+                     train_idx: np.ndarray, epochs: int, config: TrainConfig,
+                     device: torch.device) -> nn.Module:
+    """Refit on the complete outer-training fold after model selection."""
+    if epochs < 1:
+        raise ValueError("epochs must be positive")
+    loader = make_loader(
+        bmode, ulm, density, valid, labels, train_idx,
+        config.batch_size, shuffle=True,
+    )
+    weights = class_weights(
+        labels[train_idx], device, power=config.class_weight_power
+    )
+    optimizer = AdamW(model.parameters(), lr=config.lr,
+                      weight_decay=config.weight_decay)
+    # Match the inner-training learning-rate trajectory.  Using ``epochs`` as
+    # T_max here would decay to eta_min much earlier than the model-selection
+    # runs and make the selected epoch non-transferable.
+    scheduler = CosineAnnealingLR(
+        optimizer, T_max=max(1, config.epochs * len(loader)), eta_min=1e-6
+    )
+    for _ in range(epochs):
+        model.train()
+        for b, u, d, mask, target in loader:
+            b, u, d = b.to(device), u.to(device), d.to(device)
+            mask, target = mask.to(device), target.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            loss = F.cross_entropy(
+                model(b, u, d, mask), target, weight=weights
+            )
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+            optimizer.step()
+            scheduler.step()
+    return model
+
+
+def select_with_inner_oof(bmode: torch.Tensor, ulm: torch.Tensor,
+                          density: torch.Tensor, valid: torch.Tensor,
+                          labels: torch.Tensor, outer_train: np.ndarray,
+                          config: TrainConfig, device: torch.device,
+                          seed: int) -> tuple[int, float, dict]:
+    """Estimate epochs and threshold using every outer-training patient once."""
+    if config.inner_folds < 2:
+        raise ValueError("inner_folds must be at least 2")
+    y_outer = labels[outer_train].numpy()
+    splitter = StratifiedKFold(
+        n_splits=config.inner_folds, shuffle=True, random_state=seed
+    )
+    inner_probability = np.full(len(outer_train), np.nan, dtype=np.float32)
+    best_epochs = []
+    for inner_fold, (rel_train, rel_val) in enumerate(
+        splitter.split(np.arange(len(outer_train)), y_outer), start=1
+    ):
+        inner_train = outer_train[rel_train]
+        inner_val = outer_train[rel_val]
+        seed_everything(seed + inner_fold)
+        model = build_model(
+            config, bc_dim=bmode.shape[2], n_views=bmode.shape[1]
+        ).to(device)
+        model, _, diagnostics = fit_inner_split(
+            model, bmode, ulm, density, valid, labels,
+            inner_train, inner_val, config, device,
+        )
+        val_loader = make_loader(
+            bmode, ulm, density, valid, labels, inner_val,
+            config.batch_size, shuffle=False,
+        )
+        probability, target = predict(model, val_loader, device)
+        if not np.array_equal(target, y_outer[rel_val]):
+            raise RuntimeError("inner OOF labels are misaligned")
+        inner_probability[rel_val] = probability
+        best_epochs.append(int(diagnostics["best_epoch"]) + 1)
+
+    if np.isnan(inner_probability).any():
+        raise RuntimeError("inner cross-validation did not cover every patient")
+    selected_epochs = max(1, int(np.median(best_epochs)))
+    threshold = select_operating_threshold(
+        y_outer, inner_probability,
+        objective=config.threshold_objective,
+        recall_floor=config.recall_floor,
+    )
+    diagnostics = {
+        "inner_best_epochs": best_epochs,
+        "selected_epochs": selected_epochs,
+        "inner_oof_metrics": classification_metrics(
+            y_outer, inner_probability, threshold
+        ),
+    }
+    return selected_epochs, threshold, diagnostics
+
+
 def nested_cross_validate(bmode: torch.Tensor, ulm: torch.Tensor,
                           density: torch.Tensor, valid: torch.Tensor,
                           labels: torch.Tensor, config: TrainConfig,
                           output_dir: Path, device: torch.device,
                           seed: int = SEED) -> list[dict]:
+    if config.ensemble_size < 1:
+        raise ValueError("ensemble_size must be at least 1")
     output_dir.mkdir(parents=True, exist_ok=True)
     y_np = labels.numpy()
     outer = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
@@ -395,30 +743,36 @@ def nested_cross_validate(bmode: torch.Tensor, ulm: torch.Tensor,
     for fold, (outer_train, outer_test) in enumerate(
         outer.split(np.arange(len(labels)), y_np), start=1
     ):
-        inner_split = StratifiedShuffleSplit(
-            n_splits=1, test_size=0.2, random_state=seed + fold
-        )
-        rel_train, rel_val = next(inner_split.split(outer_train, y_np[outer_train]))
-        inner_train = outer_train[rel_train]
-        inner_val = outer_train[rel_val]
-
-        seed_everything(seed + fold)
-        model = VascMambaHybrid(
-            d_model=config.d_model,
-            d_state=config.d_state,
-            n_layers=config.n_layers,
-            n_views=bmode.shape[1],
-            order_by_density=config.order_by_density,
-        ).to(device)
-        model, threshold, diagnostics = fit_inner_split(
-            model, bmode, ulm, density, valid, labels,
-            inner_train, inner_val, config, device,
+        selected_epochs, threshold, diagnostics = select_with_inner_oof(
+            bmode, ulm, density, valid, labels, outer_train,
+            config, device, seed=seed + fold * 100,
         )
         test_loader = make_loader(
             bmode, ulm, density, valid, labels, outer_test,
             config.batch_size, shuffle=False,
         )
-        probability, target = predict(model, test_loader, device)
+        ensemble_probability = []
+        ensemble_states = []
+        target = None
+        for member in range(config.ensemble_size):
+            member_seed = seed + fold * 1000 + member
+            seed_everything(member_seed)
+            model = build_model(
+                config, bc_dim=bmode.shape[2], n_views=bmode.shape[1]
+            ).to(device)
+            model = fit_fixed_epochs(
+                model, bmode, ulm, density, valid, labels,
+                outer_train, selected_epochs, config, device,
+            )
+            member_probability, member_target = predict(model, test_loader, device)
+            if target is None:
+                target = member_target
+            elif not np.array_equal(target, member_target):
+                raise RuntimeError("ensemble member labels are misaligned")
+            ensemble_probability.append(member_probability)
+            ensemble_states.append(copy.deepcopy(model.state_dict()))
+        probability = np.mean(ensemble_probability, axis=0)
+        assert target is not None
         oof_probability[outer_test] = probability
         oof_fold[outer_test] = fold
         oof_threshold[outer_test] = threshold
@@ -429,11 +783,11 @@ def nested_cross_validate(bmode: torch.Tensor, ulm: torch.Tensor,
         torch.save(
             {
                 "state_dict": model.state_dict(),
+                "ensemble_state_dicts": ensemble_states,
                 "threshold": threshold,
                 "config": asdict(config),
                 "fold": fold,
-                "inner_train_indices": inner_train,
-                "inner_val_indices": inner_val,
+                "outer_train_indices": outer_train,
                 "outer_test_indices": outer_test,
             },
             output_dir / f"fold_{fold}.pt",
@@ -441,7 +795,8 @@ def nested_cross_validate(bmode: torch.Tensor, ulm: torch.Tensor,
         print(
             f"fold={fold} acc={metrics['accuracy']:.4f} "
             f"bal_acc={metrics['balanced_accuracy']:.4f} "
-            f"auc={metrics['roc_auc']:.4f} f1={metrics['f1']:.4f} "
+            f"auc={metrics['roc_auc']:.4f} precision={metrics['precision']:.4f} "
+            f"recall={metrics['sensitivity']:.4f} f1={metrics['f1']:.4f} "
             f"threshold={threshold:.2f}"
         )
 
@@ -456,6 +811,33 @@ def nested_cross_validate(bmode: torch.Tensor, ulm: torch.Tensor,
         fold=oof_fold,
         threshold=oof_threshold,
     )
+    strict_pred = (oof_probability >= oof_threshold).astype(np.int64)
+    metric_keys = [
+        "accuracy", "balanced_accuracy", "roc_auc", "pr_auc", "precision",
+        "sensitivity", "specificity", "f1", "mcc",
+    ]
+    summary = {
+        "fold_mean": {
+            key: float(np.mean([result[key] for result in results]))
+            for key in metric_keys
+        },
+        "fold_sd": {
+            key: float(np.std([result[key] for result in results]))
+            for key in metric_keys
+        },
+        "pooled_strict": classification_metrics_from_predictions(
+            y_np, oof_probability, strict_pred
+        ),
+        "threshold_mean": float(oof_threshold.mean()),
+        "threshold_sd": float(oof_threshold.std()),
+        "majority_class_accuracy": float(np.max(np.bincount(y_np)) / len(y_np)),
+        "note": (
+            "pooled_strict uses only fold-specific thresholds selected from inner OOF; "
+            "the outer labels never select a threshold"
+        ),
+    }
+    with (output_dir / "nested_cv_summary.json").open("w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
     return results
 
 
@@ -467,6 +849,8 @@ def train_hybrid(model, X_bmode, X_ulm, X_density, y, idx_train, idx_val,
     not be used to claim an unbiased test result.  New experiments should call
     :func:`nested_cross_validate`.
     """
+    if not isinstance(model, VascMambaHybrid):
+        raise TypeError("train_hybrid is a legacy VascMambaHybrid-only wrapper")
     valid = torch.ones_like(X_density, dtype=torch.bool) if X_valid is None else X_valid
     config = TrainConfig(
         d_model=model.head[1].in_features,
@@ -531,7 +915,7 @@ def load_per_view_features(path: Path):
 
 def summarize(results: list[dict]) -> None:
     keys = [
-        "accuracy", "balanced_accuracy", "roc_auc", "pr_auc",
+        "accuracy", "balanced_accuracy", "roc_auc", "pr_auc", "precision",
         "sensitivity", "specificity", "f1", "mcc",
     ]
     print("\nNested outer-fold results (mean ± fold SD)")
@@ -552,9 +936,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument(
-        "--order-by-density", action="store_true",
-        help="Ablation only: sort paired B-mode/ULM views by ULM density",
+        "--architecture", choices=["fusion_v2", "mamba_v1"], default="fusion_v2",
     )
+    parser.add_argument("--view-dropout", type=float, default=0.10)
+    parser.add_argument("--inner-folds", type=int, default=3)
+    parser.add_argument("--ensemble-size", type=int, default=3)
+    parser.add_argument(
+        "--class-weight-power", type=float, default=1.0,
+        help="0=unweighted CE, 1=fully balanced CE; intermediate values are ablations",
+    )
+    parser.add_argument(
+        "--threshold-objective",
+        choices=["clinical", "f1", "balanced_accuracy"], default="f1",
+    )
+    parser.add_argument(
+        "--recall-floor", type=float, default=0.90,
+        help="Minimum malignant recall used by the clinical threshold objective",
+    )
+    order_group = parser.add_mutually_exclusive_group()
+    order_group.add_argument(
+        "--order-by-density", dest="order_by_density", action="store_true",
+        help="Sort paired B-mode/ULM views by ULM density",
+    )
+    order_group.add_argument(
+        "--preserve-view-order", dest="order_by_density", action="store_false",
+        help="Keep the dataset view order",
+    )
+    parser.set_defaults(order_by_density=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -564,14 +972,27 @@ def main() -> None:
     seed_everything(args.seed)
     device = torch.device(args.device)
     bmode, ulm, density, valid, labels = load_per_view_features(args.features)
+    order_by_density = (
+        args.architecture == "fusion_v2"
+        if args.order_by_density is None else args.order_by_density
+    )
     config = TrainConfig(
+        architecture=args.architecture,
         epochs=args.epochs,
         batch_size=args.batch_size,
-        order_by_density=args.order_by_density,
+        order_by_density=order_by_density,
+        view_dropout=args.view_dropout,
+        inner_folds=args.inner_folds,
+        ensemble_size=args.ensemble_size,
+        class_weight_power=args.class_weight_power,
+        threshold_objective=args.threshold_objective,
+        recall_floor=args.recall_floor,
     )
     print(
         f"samples={len(labels)} views={bmode.shape[1]} feature_dim={bmode.shape[2]} "
-        f"valid_views={int(valid.sum())}/{valid.numel()} device={device}"
+        f"valid_views={int(valid.sum())}/{valid.numel()} device={device} "
+        f"architecture={config.architecture} density_order={config.order_by_density} "
+        f"ensemble={config.ensemble_size}"
     )
     results = nested_cross_validate(
         bmode, ulm, density, valid, labels, config,
