@@ -57,7 +57,7 @@ python extract_biomedclip_perview_features.py \
   --private-root /root/medic_data \
   --output /root/medic_data/biomedclip_perview_features.npz
 
-# 2. 严格nested CV；默认不做人为density排序
+# 2. 严格nested CV；fusion_v2默认进行配对安全的density排序
 python hybrid.py \
   --features /root/medic_data/biomedclip_perview_features.npz \
   --output-dir hybrid_nested_outputs
@@ -100,6 +100,7 @@ python hybrid.py \
 |---|---|
 | `hybrid.py` | 当前推荐：真实逐视图特征、配对安全、nested CV |
 | `extract_biomedclip_perview_features.py` | 可复现的逐视图BiomedCLIP特征提取 |
+| `training_free_retrieval.py` | 免梯度训练的双类别逐视图cache/prototype/subspace检索基线 |
 | `hybrid_perview.py` | 旧逐视图实验入口；评价协议仍为历史协议 |
 | `patch_vascmamba.py` | CLS + 多尺度patch token实验 |
 | `pyramid_vascmamba.py` | 早期多尺度mean pooling实验 |
@@ -114,3 +115,30 @@ python hybrid.py \
 `x_proj` 额外输出，同时保持参数shape与历史Hybrid checkpoint兼容。若研究结论
 要归因于Mamba，
 仍需与参数量匹配的MLP、DeepSets和attention pooling基线进行消融。
+
+## Training-free检索基线
+
+`training_free_retrieval.py`受Tip-Adapter的key-value cache思想和SubspaceAD的
+子空间思想启发，但针对本任务改成**良性/恶性双类别记忆库**，而不是把恶性简单
+当作偏离良性的异常：
+
+```text
+冻结BiomedCLIP逐视图特征
+  → 查询患者与记忆患者做四视图对称集合匹配
+  → 分别聚合top-k良性、top-k恶性邻居
+  → 融合类别prototype距离和类别条件PCA残差
+  → malignant score
+```
+
+全流程没有反向传播或可学习参数；`k`、B-mode/ULM权重、density惩罚和融合方式
+只在内层3-fold OOF中选择，阈值也只来自内层OOF，外层测试fold不参与选择。
+
+```bash
+python training_free_retrieval.py \
+  --features /root/medic_data/biomedclip_perview_features.npz \
+  --output-dir retrieval_outputs
+```
+
+主要输出为`retrieval_summary.json`、`retrieval_metrics.json`和
+`retrieval_oof.npz`。应与`fusion_v2`使用完全相同的外层划分比较，并进一步
+评估两者OOF分数融合；不能从外层结果中挑选最佳检索配置。
